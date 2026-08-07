@@ -119,6 +119,15 @@ box_line() { # $1 already-colored content
   printf '%s│%s %s%s %s│%s\n' "$MAGENTA" "$RESET" "$1" "$(repeat ' ' "$pad")" "$MAGENTA" "$RESET"
 }
 
+# One iteration per screen. Without this the previous board and its stream rail
+# sit directly above the new ones, so a single window shows two progress boxes
+# and two rails. A window's worth of blank lines scrolls the old frame out of
+# view while leaving it in scrollback.
+new_screen() {
+  [ "$STREAM_TTY" -eq 1 ] || return 0
+  repeat $'\n' "$(tput lines 2>/dev/null || echo 50)"
+}
+
 progress_bar() { # $1 done, $2 total, $3 width
   local done=$1 total=$2 w=$3 filled
   [ "$total" -eq 0 ] && total=1
@@ -988,6 +997,9 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
       esac
     fi
   fi
+
+  # Not on the first iteration — the banner is the only thing above it.
+  if [ "$i" -gt 1 ]; then new_screen; fi
 
   render_board "$BOARD" "$i" "${DIM}${OPEN} open${RESET}"
 
