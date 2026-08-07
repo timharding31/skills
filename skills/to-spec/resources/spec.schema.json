@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude.local/schemas/spec.schema.json",
+  "title": "Spec",
+  "description": "One unit of planned work: durable context, plus an optional ordered list of issues. Written by /to-spec (without issues), populated by /to-issues, executed one issue per iteration by loop.sh. Everything here is written once and read many times, so every field is chosen for what a fresh agent needs in a context window that contains nothing else.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "slug", "title", "summary", "invariants"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "slug": {
+      "$ref": "#/$defs/slug",
+      "description": "Kebab-case identifier for the effort. Must match the containing directory name."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable name for the effort."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 800,
+      "description": "What this effort changes and why, in 1-3 sentences. INJECTED INTO EVERY LOOP ITERATION — keep it short enough that repeating it costs nothing."
+    },
+    "context": {
+      "type": "string",
+      "description": "Long-form background: research, provenance, rejected alternatives, links. NOT injected into loop iterations. Written for humans and for /to-issues, which reads it once when decomposing."
+    },
+    "invariants": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "maxItems": 12,
+      "description": "Rules that hold for every issue in this effort, phrased as absolutes an implementer can violate ('Sleeper player_id is the canonical player PK', 'no DB migrations'). INJECTED INTO EVERY ITERATION. Aim for 3-6."
+    },
+    "out_of_scope": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Adjacent work this effort deliberately does not do. INJECTED INTO EVERY ITERATION — this is the main defence against scope bleed."
+    },
+    "verification": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Shell commands that must pass before an issue counts as done ('npm test', 'npm run build'). INJECTED INTO EVERY ITERATION."
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Unresolved decisions. Not injected. /to-issues should resolve or explicitly defer these before writing issues."
+    },
+    "issues": {
+      "type": "array",
+      "description": "Ordered by priority: the loop picks the FIRST issue whose blockers are all done. Absent until /to-issues runs; loop.sh fails loudly if it is missing or empty.",
+      "items": { "$ref": "#/$defs/issue" }
+    },
+    "ledger": {
+      "type": "array",
+      "description": "Append-only record of completed issues, written by loop.sh from each iteration's DONE promise. INJECTED INTO EVERY ITERATION so a later issue learns what an earlier one built without reading its ticket.",
+      "items": { "$ref": "#/$defs/ledger_entry" }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "status", "blocked_by", "body", "criteria"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/slug",
+          "description": "Stable kebab-case identity, unique within the spec. Used in blocked_by, in the ledger, and in the agent's DONE promise."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One line, imperative. Shown on the board and in the prompt."
+        },
+        "status": {
+          "enum": ["ready", "claimed", "done"],
+          "description": "Owned by loop.sh, never by the implementing agent. 'claimed' means an iteration started it and did not report done — it is re-picked on the next pass. Blocked is derived from blocked_by, not stored."
+        },
+        "blocked_by": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/slug" },
+          "uniqueItems": true,
+          "description": "Ids of issues that must be done first. Empty array means immediately workable."
+        },
+        "body": {
+          "type": ["string", "null"],
+          "pattern": "^issues/[a-z0-9]+(?:-[a-z0-9]+)*\\.md$",
+          "description": "Path to the prose body, relative to the spec directory: issues/<id>.md. Null when the criteria say everything and no rationale is needed."
+        },
+        "files": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Paths or directories the implementer should start from, to skip a discovery phase."
+        },
+        "criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Observable conditions that define done. The single source of truth — never duplicated into the body file. Injected verbatim as the ticket's definition of done."
+        }
+      }
+    },
+    "ledger_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "outcome"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "outcome": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One line: what now exists that did not before, named concretely enough for a later issue to use it."
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

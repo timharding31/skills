@@ -1,0 +1,106 @@
+---
+name: to-issues
+description: Decompose a spec.json into an ordered, dependency-aware list of issues plus one prose body file each. Use when the user wants to break a spec into tickets, plan implementation slices, or says "to-issues". Run after /to-spec.
+---
+
+# To Issues
+
+Take a `spec.json` written by [`/to-spec`](../to-spec/SKILL.md) and fill in its `issues` array, writing one prose body per issue at `<spec-dir>/issues/<id>.md`.
+
+Schema: [`../to-spec/resources/spec.schema.json`](../to-spec/resources/spec.schema.json). Read it before writing.
+
+## What consumes this
+
+[`~/.claude/scripts/loop.sh`](../../scripts/loop.sh) implements the effort one issue per iteration. Each iteration gets a **fresh context window** containing the spec's summary/invariants/out-of-scope/ledger, plus **exactly one** issue — its title, its `criteria`, its `files`, and its body file. It never sees the others.
+
+Two consequences that shape everything below:
+
+1. **The script picks, not the model.** It takes the first issue in array order whose `blocked_by` are all done. **Array order is priority order** — put them in the order you want them built.
+2. **An issue must be implementable from its own body plus the spec's invariants.** No "as discussed in the previous ticket", no cross-references to siblings. What a later issue needs from an earlier one arrives through the `ledger`, which the loop writes automatically.
+
+## Where each thing lives
+
+Metadata is in JSON, prose is in markdown, and they never duplicate each other.
+
+| Goes in `spec.json` | Goes in `issues/<id>.md` |
+| --- | --- |
+| `id`, `title`, `status`, `blocked_by` | Why this slice exists |
+| `criteria` — the definition of done | What the shape of the solution is, and what it must not be |
+| `files` — where to start | Constraints and gotchas specific to this issue |
+| | A trailing `## Comments` heading |
+
+The body file carries **no** status line, **no** blocked-by line, and **no** checkbox list. Those were the fragile parts of the old markdown format; they are structured fields now. Duplicating criteria into the body guarantees the two drift.
+
+## Process
+
+### 1. Read the spec whole
+
+Including `context` — it exists for this moment. Note the `invariants`: they're injected into every issue's prompt, so never restate them in a body.
+
+### 2. Ground the slices in the code
+
+Use the Agent tool with `subagent_type=Explore` to check where each slice would actually land. An issue whose `files` are wrong costs the implementing agent a discovery phase you were supposed to save it.
+
+### 3. Slice
+
+Each issue should be a **tracer bullet**: a thin vertical slice that leaves the repo working, tested, and committable on its own. Not a layer ("add the types"), not a phase ("do the backend").
+
+Sizing: one issue ≈ one focused agent session. If you can't state its done-ness in 2–5 observable criteria, it's too big — split it. If it can't be verified without its neighbour, it's too small — merge it.
+
+Ordering: dependency order first, then risk. Put the issue that proves the risky assumption early, so a wrong assumption surfaces on iteration 1 rather than iteration 6.
+
+### 4. Write the bodies
+
+`<spec-dir>/issues/<id>.md`, where `<id>` is the issue's kebab-case id — the filename and the id must match.
+
+```markdown
+# <title>
+
+<Why this slice exists and what it unlocks — a short paragraph.>
+
+<The shape the solution should take: the seam it creates or consumes, the
+approach to prefer, the approach to avoid and why. Enough that an agent with
+no other context makes the same call you would.>
+
+## Comments
+```
+
+Keep it to what changes the implementation. The loop appends the agent's own notes under `## Comments` as work completes.
+
+Use `"body": null` when the criteria genuinely say everything and there's no rationale to give. Don't write a body that only restates the title.
+
+### 5. Write the issues array
+
+- `id` — kebab-case, stable, unique. It appears in `blocked_by`, in the ledger, and in the agent's completion promise.
+- `status` — `"ready"` for everything. The loop owns this field from here on.
+- `blocked_by` — ids only, and only *hard* blockers: this issue cannot be correctly built until that one exists. Do not encode mere preference; a false blocker serialises work that could have been done in any order.
+- `criteria` — observable conditions, each checkable by running something or reading the resulting code. "Replacement level shifts with superflex" is checkable. "Code is clean" is not.
+- `files` — the paths to start from.
+
+### 6. Validate
+
+```bash
+~/.claude/scripts/loop.sh <spec-dir> --check
+```
+
+This checks ids are unique, blockers resolve, criteria exist, statuses are legal, and every `body` file is on disk — then prints the board with the blocked chain drawn. A cycle shows up as every issue waiting on another.
+
+### 7. Report
+
+Show the user the board, name the starting frontier (everything with no blockers), and tell them to run:
+
+```bash
+~/.claude/scripts/loop.sh <spec-dir>
+```
+
+## Re-running on a spec that's already in flight
+
+Never touch `status` on issues that are `done` or `claimed`, and never touch `ledger` — that's execution state and rewriting it loses the record of what was built. Add new issues to the array in the position their priority warrants, and only edit the `criteria` or `body` of issues still `ready`.
+
+## Anti-patterns
+
+- **Layer slices.** "Add types", then "add the service", then "wire the UI" — nothing is shippable until the last one, and the first two can't be verified.
+- **Cross-referencing siblings.** "Reuse the helper from `vorp-seam`." The implementer can't see that issue. Put the fact in the criteria, or let the ledger carry it.
+- **Restating invariants in bodies.** They're already in every prompt. Repetition just crowds the part that's specific to this issue.
+- **Blocking on preference.** Every false edge in `blocked_by` narrows the frontier and lengthens the run.
+- **Unfalsifiable criteria.** If nothing observable distinguishes done from not-done, the loop can't tell either.
