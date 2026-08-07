@@ -101,6 +101,10 @@
           "items": { "type": "string", "minLength": 1 },
           "description": "Paths or directories the implementer should start from, to skip a discovery phase."
         },
+        "model": {
+          "enum": ["", "haiku", "sonnet", "opus"],
+          "description": "Model this issue runs on, overriding loop.sh's default (--model, else CLAUDE_MODEL, else whatever claude is configured with). Omit or leave empty to take the default. Set it per issue when a ticket is mechanical enough for haiku or subtle enough to need opus."
+        },
         "criteria": {
           "type": "array",
           "minItems": 1,

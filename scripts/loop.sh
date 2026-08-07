@@ -24,12 +24,16 @@ the model — picks the next issue (first in array order whose blockers are all
 done), injects only that issue plus the spec's summary/invariants/ledger, and
 records the result. The agent never edits spec.json.
 
+An issue may carry a "model" field ("haiku" | "sonnet" | "opus", or empty for
+the default) to override --model/CLAUDE_MODEL for that iteration only.
+
 GitHub mode works through the sub-issues of a parent issue, letting the model
 pick. It requires the gh CLI.
 
 Env:
   MAX_ITERATIONS   default iteration cap (default: 50)
-  CLAUDE_MODEL     default model (default: whatever claude is configured with)
+  CLAUDE_MODEL     default model, overridable per issue (default: whatever
+                   claude is configured with)
   CLAUDE_CMD       command used to run claude (default: "claude")
   RETRIES          retries per iteration on API errors (default: 3)
   RETRY_DELAY      base backoff seconds, multiplied per attempt (default: 20)
@@ -227,17 +231,24 @@ NO_PROGRESS=0
 if [ -n "$ITERATIONS" ] && ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
   die "max-iterations must be a positive integer, got $ITERATIONS."
 fi
-MODEL_ARGS=()
-[ -n "$MODEL" ] && MODEL_ARGS=(--model "$MODEL")
-MODEL_LABEL="${MODEL:-default}"
 
-case "$MODEL" in
-  opus)   MODEL_COLOR="$MAGENTA" ;;
-  sonnet) MODEL_COLOR="$BLUE" ;;
-  haiku)  MODEL_COLOR="$TEAL" ;;
-  fable)  MODEL_COLOR="$ORANGE" ;;
-  *)      MODEL_COLOR="$DIM" ;;
-esac
+# The model in force for the next claude invocation. An issue's "model" field
+# beats this default for its iteration only, so one run can put cheap tickets on
+# haiku without splitting into several runs.
+use_model() { # $1 model name, "" = whatever claude is configured with
+  MODEL_ARGS=()
+  [ -n "$1" ] && MODEL_ARGS=(--model "$1")
+  MODEL_LABEL="${1:-default}"
+  case "$1" in
+    opus)   MODEL_COLOR="$MAGENTA" ;;
+    sonnet) MODEL_COLOR="$BLUE" ;;
+    haiku)  MODEL_COLOR="$TEAL" ;;
+    fable)  MODEL_COLOR="$ORANGE" ;;
+    *)      MODEL_COLOR="$DIM" ;;
+  esac
+}
+
+use_model "$MODEL"
 
 [ -n "$TARGET" ] || { usage >&2; die "no spec path or GitHub issue URL given."; }
 
@@ -307,6 +318,9 @@ validate_spec() {
           | select((["ready","claimed","done"] | index($i.status // "")) == null)
           | "\($i.id): invalid status \"\($i.status // "")\""),
         ($is[] | . as $i
+          | select((["haiku","sonnet","opus",""] | index($i.model // "")) == null)
+          | "\($i.id): invalid model \"\($i.model)\" (expected haiku, sonnet, or opus)"),
+        ($is[] | . as $i
           | select((($i.blocked_by // []) | index($i.id)) != null)
           | "\($i.id): blocks itself"),
         ($is[] | . as $i | ($i.blocked_by // [])[]
@@ -375,7 +389,7 @@ next_issue() {
     | map(select(.status != "done"))
     | map(select(all(.blocked_by[]?; . as $b | ($done | index($b)) != null)))
     | first // empty
-    | [.id, (.body // ""), .title] | join("")
+    | [.id, (.body // ""), (.model // ""), .title] | join("")
   ' "$SPEC"
 }
 
@@ -539,10 +553,21 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     exit 0
   fi
 
+  # Picked before the board is drawn so the board's model chip names the model
+  # this iteration will actually run on.
+  ISSUE_ID=
+  if [ "$MODE" = spec ]; then
+    # The script picks, so the model spends no context deciding and the choice
+    # is reproducible from the graph.
+    # `|| true`: an empty frontier makes read fail, and set -e would kill the
+    # run before the diagnostic below explains why
+    IFS=$'\037' read -r ISSUE_ID ISSUE_BODY ISSUE_MODEL ISSUE_TITLE < <(next_issue) || true
+    use_model "${ISSUE_MODEL:-$MODEL}"
+  fi
+
   render_board "$BOARD" "$i" "${DIM}${OPEN} open${RESET}"
 
   if [ "$MODE" = gh ]; then
-    ISSUE_ID=
     SUB_LIST=$(jq -r '.[] | select(.state != "done") | "  - #\(.number): \(.title)"' <<<"$BOARD")
     PROMPT="Parent issue: $SOURCE_DETAIL ($SLUG#$PARENT — $PARENT_TITLE)
 Open sub-issues:
@@ -555,12 +580,6 @@ $SUB_LIST
 ONLY WORK ON A SINGLE SUB-ISSUE.
 If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMPLETE</promise>."
   else
-    # The script picks, so the model spends no context deciding and the choice
-    # is reproducible from the graph.
-    # `|| true`: an empty frontier makes read fail, and set -e would kill the
-    # run before the diagnostic below explains why
-    IFS=$'\037' read -r ISSUE_ID ISSUE_BODY ISSUE_TITLE < <(next_issue) || true
-
     if [ -z "$ISSUE_ID" ]; then
       printf '\n%s✖%s  %s issue(s) remain but none are workable — every one is blocked.\n\n' \
         "$RED" "$RESET" "$OPEN" >&2

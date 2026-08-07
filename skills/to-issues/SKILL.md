@@ -76,6 +76,7 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 - `blocked_by` — ids only, and only *hard* blockers: this issue cannot be correctly built until that one exists. Do not encode mere preference; a false blocker serialises work that could have been done in any order.
 - `criteria` — observable conditions, each checkable by running something or reading the resulting code. "Replacement level shifts with superflex" is checkable. "Code is clean" is not.
 - `files` — the paths to start from.
+- `model` — **omit unless the user asks for per-issue models.** `"haiku"`, `"sonnet"`, or `"opus"`; it overrides the model `loop.sh` was launched with, for that iteration only. When they do ask, assign it from the work: mechanical, well-specified edits can take `haiku`; issues carrying the design risk you ordered early take `opus`. Leave it off everywhere you have no reason to differ from the run's default.
 
 ### 6. Validate
 
