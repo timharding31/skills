@@ -28,7 +28,7 @@
     },
     "context": {
       "type": "string",
-      "description": "Long-form background: research, provenance, rejected alternatives, links. NOT injected into loop iterations. Written for humans and for /to-issues, which reads it once when decomposing."
+      "description": "Long-form background: research, provenance, rejected alternatives, links. Prefer writing this to a sibling <spec-dir>/context.md instead — loop.sh points each iteration at that file for on-demand reading, which it cannot do for a field inside spec.json (spec.json also holds the issues array, which implementers must never open). This field remains valid for a short paragraph, or for a spec written before context.md existed. /to-issues reads whichever exists."
     },
     "invariants": {
       "type": "array",
@@ -44,7 +44,7 @@
     "verification": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
-      "description": "Shell commands that must pass before an issue counts as done ('npm test', 'npm run build'). INJECTED INTO EVERY ITERATION."
+      "description": "Shell commands that must pass before an issue counts as done ('npm test', 'npm run build'). INJECTED INTO EVERY ITERATION, and EXECUTED BY loop.sh in the repo root after the agent promises DONE — an issue is only recorded as done if they all exit 0. A command that cannot succeed here blocks the whole effort, so these must be real and runnable."
     },
     "open_questions": {
       "type": "array",
@@ -58,7 +58,7 @@
     },
     "ledger": {
       "type": "array",
-      "description": "Append-only record of completed issues, written by loop.sh from each iteration's DONE promise. INJECTED INTO EVERY ITERATION so a later issue learns what an earlier one built without reading its ticket.",
+      "description": "Append-only record of completed issues, written by loop.sh from each iteration's DONE promise once the spec's verification commands have passed. INJECTED INTO EVERY ITERATION so a later issue learns what an earlier one built without reading its ticket.",
       "items": { "$ref": "#/$defs/ledger_entry" }
     }
   },
@@ -71,6 +71,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "title", "status", "blocked_by", "body", "criteria"],
+      "$comment": "status and attempts are owned by loop.sh. /to-issues writes status once ('ready') and never writes attempts.",
       "properties": {
         "id": {
           "$ref": "#/$defs/slug",
@@ -102,14 +103,39 @@
           "description": "Paths or directories the implementer should start from, to skip a discovery phase."
         },
         "model": {
-          "enum": ["", "haiku", "sonnet", "opus"],
-          "description": "Model this issue runs on, overriding loop.sh's default (--model, else CLAUDE_MODEL, else whatever claude is configured with). Omit or leave empty to take the default. Set it per issue when a ticket is mechanical enough for haiku or subtle enough to need opus."
+          "enum": ["", "haiku", "sonnet", "opus", "fable"],
+          "description": "Model this issue runs on, overriding loop.sh's default (--model, else CLAUDE_MODEL, else whatever claude is configured with). One of \"haiku\", \"sonnet\", \"opus\", or \"fable\"; omit or leave empty to take the default. Set it per issue when a ticket is mechanical enough for haiku or subtle enough to need opus."
         },
         "criteria": {
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 },
-          "description": "Observable conditions that define done. The single source of truth — never duplicated into the body file. Injected verbatim as the ticket's definition of done."
+          "description": "Observable conditions that define done. The single source of truth — never duplicated into the body file. Injected verbatim as the ticket's definition of done, and judged against the iteration's git diff by loop.sh's clean-context criteria review — so each one must be evidenced by the diff, not by stated intent."
+        },
+        "attempts": {
+          "type": "array",
+          "description": "Append-only record of iterations that started this issue and did not complete it, written by loop.sh. Never authored by hand — /to-issues must not emit this field. The most recent entries are INJECTED INTO THE PROMPT on the next attempt so a fresh context window does not repeat a known-failing approach. Length is also the circuit breaker: at ISSUE_ATTEMPT_LIMIT the loop stops rather than burning more iterations.",
+          "items": { "$ref": "#/$defs/attempt" }
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Short category of the failure: 'verification failed', 'no completion promise', 'reported blocked'."
+        },
+        "detail": {
+          "type": "string",
+          "description": "One line of specifics — the failing command, or what the agent said stopped it. Truncated by loop.sh before it is stored; may end with a pointer to the full log at <spec-dir>/attempts/<issue-id>-<n>.log."
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
         }
       }
     },
@@ -127,6 +153,10 @@
         "at": {
           "type": "string",
           "format": "date-time"
+        },
+        "commit": {
+          "type": "string",
+          "description": "HEAD after the iteration that completed this issue, when the loop ran inside a git repo. Absent outside one, or when the iteration committed nothing."
         }
       }
     }

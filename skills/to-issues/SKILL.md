@@ -11,12 +11,13 @@ Schema: [`../to-spec/resources/spec.schema.json`](../to-spec/resources/spec.sche
 
 ## What consumes this
 
-[`~/.claude/scripts/loop.sh`](../../scripts/loop.sh) implements the effort one issue per iteration. Each iteration gets a **fresh context window** containing the spec's summary/invariants/out-of-scope/ledger, plus **exactly one** issue — its title, its `criteria`, its `files`, and its body file. It never sees the others.
+[`~/.claude/scripts/loop.sh`](../../scripts/loop.sh) implements the effort one issue per iteration. Each iteration gets a **fresh context window** containing the spec's summary/invariants/out-of-scope/ledger, the tail of `<spec-dir>/NOTES.md`, a pointer to `<spec-dir>/context.md` (read on demand, when present), plus **exactly one** issue — its title, its `criteria`, its `files`, and its body file. The only thing it sees of any other issue is the `## Comments` section of its **direct blockers**.
 
-Two consequences that shape everything below:
+Three consequences that shape everything below:
 
 1. **The script picks, not the model.** It takes the first issue in array order whose `blocked_by` are all done. **Array order is priority order** — put them in the order you want them built.
-2. **An issue must be implementable from its own body plus the spec's invariants.** No "as discussed in the previous ticket", no cross-references to siblings. What a later issue needs from an earlier one arrives through the `ledger`, which the loop writes automatically.
+2. **An issue must be implementable from its own body plus the spec's invariants.** No "as discussed in the previous ticket", no cross-references to siblings. What a later issue needs from an earlier one arrives through the `ledger` and through its blockers' `## Comments`, both of which the loop carries automatically — you never author either.
+3. **Criteria must be provable from the diff, not from intent.** After verification passes, a clean-context reviewer — a fresh model sharing no context with the implementer — judges the iteration's git diff against that issue's `criteria` and can reject the DONE if the diff doesn't satisfy them. A criterion the diff can't evidence will fail review even when it's true.
 
 ## Where each thing lives
 
@@ -35,7 +36,7 @@ The body file carries **no** status line, **no** blocked-by line, and **no** che
 
 ### 1. Read the spec whole
 
-Including `context` — it exists for this moment. Note the `invariants`: they're injected into every issue's prompt, so never restate them in a body.
+Including `context`, and `<spec-dir>/context.md` when present — both exist for this moment. Note the `invariants`: they're injected into every issue's prompt, so never restate them in a body.
 
 ### 2. Ground the slices in the code
 
@@ -65,7 +66,7 @@ no other context makes the same call you would.>
 ## Comments
 ```
 
-Keep it to what changes the implementation. The loop appends the agent's own notes under `## Comments` as work completes.
+Keep it to what changes the implementation. Leave `## Comments` empty — the implementing agent writes its own notes there as work completes, and the loop feeds that section to whichever issues list this one in their `blocked_by`. That is the channel for seam-level detail the ledger's one-liner can't carry ("takes a `LeagueSettings`, not a `leagueId`"), so the heading must be present even when there's nothing under it yet.
 
 Use `"body": null` when the criteria genuinely say everything and there's no rationale to give. Don't write a body that only restates the title.
 
@@ -73,10 +74,11 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 
 - `id` — kebab-case, stable, unique. It appears in `blocked_by`, in the ledger, and in the agent's completion promise.
 - `status` — `"ready"` for everything. The loop owns this field from here on.
+- `attempts` — **never write this.** Like `status` and `ledger`, it belongs to `loop.sh`, which records each failed iteration there and replays the most recent ones into the next attempt's prompt. The one exception is replanning a stuck issue — see [Replanning a stuck issue](#replanning-a-stuck-issue---replan) below.
 - `blocked_by` — ids only, and only *hard* blockers: this issue cannot be correctly built until that one exists. Do not encode mere preference; a false blocker serialises work that could have been done in any order.
-- `criteria` — observable conditions, each checkable by running something or reading the resulting code. "Replacement level shifts with superflex" is checkable. "Code is clean" is not.
+- `criteria` — observable conditions, each checkable by running something or reading the resulting code. "Replacement level shifts with superflex" is checkable. "Code is clean" is not. Criteria are also what the post-verification diff review judges against, so write each one to be checkable by reading the diff and running the verification commands — not by trusting the implementer's stated intent.
 - `files` — the paths to start from.
-- `model` — **omit unless the user asks for per-issue models.** `"haiku"`, `"sonnet"`, or `"opus"`; it overrides the model `loop.sh` was launched with, for that iteration only. When they do ask, assign it from the work: mechanical, well-specified edits can take `haiku`; issues carrying the design risk you ordered early take `opus`. Leave it off everywhere you have no reason to differ from the run's default.
+- `model` — **omit unless the user asks for per-issue models.** `"haiku"`, `"sonnet"`, `"opus"`, or `"fable"`; it overrides the model `loop.sh` was launched with, for that iteration only. When they do ask, assign it from the work: mechanical, well-specified edits can take `haiku`; issues carrying the design risk you ordered early take `opus`. Leave it off everywhere you have no reason to differ from the run's default.
 
 ### 6. Validate
 
@@ -84,7 +86,7 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 ~/.claude/scripts/loop.sh <spec-dir> --check
 ```
 
-This checks ids are unique, blockers resolve, criteria exist, statuses are legal, and every `body` file is on disk — then prints the board with the blocked chain drawn. A cycle shows up as every issue waiting on another.
+This checks ids are unique, blockers resolve, criteria exist, statuses are legal, every `body` file is on disk, and the graph is acyclic — then prints the board with the blocked chain drawn. A cycle fails validation outright and names the issues that can never become workable.
 
 ### 7. Report
 
@@ -96,12 +98,25 @@ Show the user the board, name the starting frontier (everything with no blockers
 
 ## Re-running on a spec that's already in flight
 
-Never touch `status` on issues that are `done` or `claimed`, and never touch `ledger` — that's execution state and rewriting it loses the record of what was built. Add new issues to the array in the position their priority warrants, and only edit the `criteria` or `body` of issues still `ready`.
+Never touch `status` on issues that are `done` or `claimed`, and never touch `ledger` — that's execution state and rewriting it loses the record of what was built. Add new issues to the array in the position their priority warrants, and only edit the `criteria` or `body` of issues still `ready`. The one sanctioned exception, for an issue that's stuck rather than merely in flight, is the replan flow below.
+
+## Replanning a stuck issue (--replan)
+
+Invoked as `/to-issues <spec-dir> --replan <issue-id>` when `loop.sh` has circuit-broken on an issue at its `ISSUE_ATTEMPT_LIMIT` and told the user to run this.
+
+1. Read the issue: its body, its full `attempts` array, and the logs under `<spec-dir>/attempts/` for it.
+2. Diagnose why it's stuck: the criteria are wrong, the slice is too big, or a real blocker was missed.
+3. Fix it — one of:
+   - Rewrite the `criteria` and/or `body` in place.
+   - Split it into smaller issues, inserted at its position in the array.
+   - Add a `blocked_by` edge for a blocker that was genuinely missing.
+4. On any issue you rewrite or replace: reset its `status` to `"ready"` and clear its `attempts` array. This is the **one** sanctioned exception to "never write `attempts`" and "never touch status on issues that are done or claimed" — it applies only to the issue(s) being replanned, never to `done` issues or to `ledger`.
+5. Re-run `loop.sh <spec-dir> --check` to confirm the graph is still valid before handing it back.
 
 ## Anti-patterns
 
 - **Layer slices.** "Add types", then "add the service", then "wire the UI" — nothing is shippable until the last one, and the first two can't be verified.
-- **Cross-referencing siblings.** "Reuse the helper from `vorp-seam`." The implementer can't see that issue. Put the fact in the criteria, or let the ledger carry it.
+- **Cross-referencing siblings.** "Reuse the helper from `vorp-seam`." The implementer can't see that issue's ticket. If it's a direct blocker, its `## Comments` will arrive — but only what the implementing agent chose to write there, which you can't know in advance. Anything the slice genuinely depends on goes in the criteria.
 - **Restating invariants in bodies.** They're already in every prompt. Repetition just crowds the part that's specific to this issue.
 - **Blocking on preference.** Every false edge in `blocked_by` narrows the frontier and lengthens the run.
 - **Unfalsifiable criteria.** If nothing observable distinguishes done from not-done, the loop can't tell either.

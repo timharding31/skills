@@ -24,20 +24,37 @@ the model — picks the next issue (first in array order whose blockers are all
 done), injects only that issue plus the spec's summary/invariants/ledger, and
 records the result. The agent never edits spec.json.
 
-An issue may carry a "model" field ("haiku" | "sonnet" | "opus", or empty for
-the default) to override --model/CLAUDE_MODEL for that iteration only.
+An issue is recorded done only when the agent promises DONE, every command in
+the spec's "verification" array exits 0, AND a clean-context review (a second,
+independent claude call that never saw the implementation) confirms the diff
+meets the ticket's criteria. A promise alone is not enough: the loop runs the
+checks itself. A failed iteration is recorded on the issue and replayed into
+the next attempt's prompt, so a fresh context window does not repeat an
+approach that already failed.
+
+An issue may carry a "model" field ("haiku" | "sonnet" | "opus" | "fable", or
+empty for the default) to override --model/CLAUDE_MODEL for that iteration only.
 
 GitHub mode works through the sub-issues of a parent issue, letting the model
-pick. It requires the gh CLI.
+pick. It requires the gh CLI. The verification gate and attempt tracking are
+spec-mode only — GitHub mode has no spec to read them from.
 
 Env:
   MAX_ITERATIONS   default iteration cap (default: 50)
+  MAX_COST         stop before starting an iteration once this many dollars
+                   have been spent (default: no limit)
   CLAUDE_MODEL     default model, overridable per issue (default: whatever
                    claude is configured with)
   CLAUDE_CMD       command used to run claude (default: "claude")
   RETRIES          retries per iteration on API errors (default: 3)
   RETRY_DELAY      base backoff seconds, multiplied per attempt (default: 20)
   STALL_LIMIT      stop after N iterations that finish nothing (default: 2)
+  ISSUE_ATTEMPT_LIMIT
+                   stop once one issue has failed this many times (default: 3)
+  JUDGE_MODEL      model used for the clean-context criteria review after
+                   verification passes (default: haiku; empty disables it)
+  ESCALATE         set to 1 to bump the model a tier (haiku→sonnet→opus) when
+                   retrying an issue that already failed (default: off)
   PERMISSION_MODE  claude --permission-mode (default: auto; the loop needs
                    gh/git/test commands, which acceptEdits does not cover)
   STREAM_WINDOW    live events kept on screen, older ones collapse to "..."
@@ -225,11 +242,70 @@ CLAUDE_CMD="${CLAUDE_CMD:-claude}"
 RETRIES="${RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-20}"
 STALL_LIMIT="${STALL_LIMIT:-2}"
+ISSUE_ATTEMPT_LIMIT="${ISSUE_ATTEMPT_LIMIT:-3}"
+JUDGE_MODEL="${JUDGE_MODEL-haiku}"
+ESCALATE="${ESCALATE:-0}"
 PERMISSION_MODE="${PERMISSION_MODE:-auto}"
 NO_PROGRESS=0
+SPENT=0
+
+# Iterations are traceable only inside a repo, but the loop still runs outside
+# one — every git call is guarded by this.
+IS_GIT=0
+git rev-parse --git-dir >/dev/null 2>&1 && IS_GIT=1
+
+head_sha() { [ "$IS_GIT" -eq 1 ] && git rev-parse HEAD 2>/dev/null || true; }
+
+# What an iteration actually left behind. The old message asserted "nothing was
+# committed" without checking, which is false whenever an agent commits and then
+# dies on the next tool call.
+report_commits() { # $1 sha before the iteration
+  local before=$1 after n
+  [ "$IS_GIT" -eq 1 ] && [ -n "$before" ] || return 0
+  after=$(head_sha)
+
+  if [ "$after" = "$before" ]; then
+    printf '   %sNothing was committed; the working tree may still hold partial work.%s\n' "$DIM" "$RESET"
+    return 0
+  fi
+
+  n=$(git rev-list --count "$before..$after" 2>/dev/null || echo "?")
+  printf '   %s%s commit(s) landed: %s..%s%s\n' "$DIM" "$n" "${before:0:7}" "${after:0:7}" "$RESET"
+  printf '   %sTo discard them:  git reset --hard %s%s\n' "$DIM" "${before:0:7}" "$RESET"
+}
+
+# bash has no floats; jq is already a hard dependency, so the money lives there.
+add_cost() { # $1 addend
+  SPENT=$(jq -n --arg a "$SPENT" --arg b "${1:-0}" \
+    '(($a | tonumber) + ($b | tonumber)) * 10000 | round / 10000')
+}
+
+over_budget() {
+  [ -n "${MAX_COST:-}" ] || return 1
+  [ "$(jq -n --arg s "$SPENT" --arg m "$MAX_COST" \
+        '(($s | tonumber) >= ($m | tonumber))')" = "true" ]
+}
+
+cost_chip() {
+  [ "$(jq -n --arg s "$SPENT" '($s | tonumber) > 0')" = "true" ] || return 0
+  printf '   %s$%s%s%s' "$DIM" "$SPENT" "${MAX_COST:+/$MAX_COST}" "$RESET"
+}
+
+spend_note() {
+  [ "$(jq -n --arg s "$SPENT" '($s | tonumber) > 0')" = "true" ] || return 0
+  printf ' %s($%s spent)%s' "$DIM" "$SPENT" "$RESET"
+}
 
 if [ -n "$ITERATIONS" ] && ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
   die "max-iterations must be a positive integer, got $ITERATIONS."
+fi
+
+if [ -n "${MAX_COST:-}" ] && ! [[ "$MAX_COST" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  die "MAX_COST must be a number of dollars, got $MAX_COST."
+fi
+
+if ! [[ "$ISSUE_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  die "ISSUE_ATTEMPT_LIMIT must be a positive integer, got $ISSUE_ATTEMPT_LIMIT."
 fi
 
 # The model in force for the next claude invocation. An issue's "model" field
@@ -318,8 +394,8 @@ validate_spec() {
           | select((["ready","claimed","done"] | index($i.status // "")) == null)
           | "\($i.id): invalid status \"\($i.status // "")\""),
         ($is[] | . as $i
-          | select((["haiku","sonnet","opus",""] | index($i.model // "")) == null)
-          | "\($i.id): invalid model \"\($i.model)\" (expected haiku, sonnet, or opus)"),
+          | select((["haiku","sonnet","opus","fable",""] | index($i.model // "")) == null)
+          | "\($i.id): invalid model \"\($i.model)\" (expected haiku, sonnet, opus, or fable)"),
         ($is[] | . as $i
           | select((($i.blocked_by // []) | index($i.id)) != null)
           | "\($i.id): blocks itself"),
@@ -341,6 +417,37 @@ validate_spec() {
       [ -n "$problem" ] && printf '   %s·%s %s\n' "$RED" "$RESET" "$problem" >&2
     done <<<"$problems"
     printf '\n' >&2
+    exit 1
+  fi
+
+  # Cycles are checked separately, and only once the above is clean: an unknown
+  # blocker also makes its dependents unsettleable, which would report a cycle
+  # that isn't there. Kahn's algorithm — peel off issues whose blockers are all
+  # settled until nothing more can be; whatever remains is a cycle or downstream
+  # of one. Status is ignored: a cyclic graph is malformed even when part of it
+  # has already been built.
+  local cyclic
+  cyclic=$(jq -r '
+    { rest: [ (.issues // [])[] | {id: .id, b: (.blocked_by // [])} ], settled: [] }
+    | until(
+        . as $s
+        | ($s.rest
+           | map(select(all(.b[]; . as $x | ($s.settled | index($x)) != null)))
+           | length) == 0;
+        . as $s
+        | ($s.rest
+           | map(select(all(.b[]; . as $x | ($s.settled | index($x)) != null)))
+           | map(.id)) as $ready
+        | { rest:    ($s.rest | map(. as $i | select(($ready | index($i.id)) == null))),
+            settled: ($s.settled + $ready) })
+    | .rest | map(.id) | join(", ")
+  ' "$SPEC")
+
+  if [ -n "$cyclic" ]; then
+    printf '\n%s✖%s  %s has a dependency cycle.\n\n' "$RED" "$RESET" "$SPEC" >&2
+    printf '   %sUnreachable: %s%s\n' "$RED" "$cyclic" "$RESET" >&2
+    printf '\n   %sThose issues can never all become workable. Break the cycle by\n' "$DIM" >&2
+    printf '   removing a blocked_by edge that encodes preference, not necessity.%s\n\n' "$RESET" >&2
     exit 1
   fi
 }
@@ -410,11 +517,135 @@ claim_issue() { # $1 id
   write_spec '(.issues[] | select(.id == $id) | .status) = "claimed"' --arg id "$1"
 }
 
-finish_issue() { # $1 id, $2 outcome
+finish_issue() { # $1 id, $2 outcome, $3 commit sha (may be empty)
   write_spec '
     (.issues[] | select(.id == $id) | .status) = "done"
-    | .ledger = ((.ledger // []) + [{id: $id, outcome: $outcome, at: $at}])
-  ' --arg id "$1" --arg outcome "$2" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    | .ledger = ((.ledger // []) + [
+        {id: $id, outcome: $outcome, at: $at}
+        + (if $commit == "" then {} else {commit: $commit} end)])
+  ' --arg id "$1" --arg outcome "$2" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg commit "$3"
+}
+
+# A fresh context window is the point, but it also means the next attempt on a
+# failed ticket knows nothing about the last one and will happily repeat it.
+# Recording the failure here is what issue_block replays back into the prompt.
+record_attempt() { # $1 id, $2 reason, $3 detail
+  local detail
+  detail=$(printf '%s' "$3" | tr '\n\t' '  ' | sed -E 's/  +/ /g; s/^ +//; s/ +$//')
+  [ "${#detail}" -gt 400 ] && detail="${detail:0:399}…"
+  write_spec '
+    (.issues[] | select(.id == $id) | .attempts) =
+      (((.issues[] | select(.id == $id) | .attempts) // [])
+       + [{reason: $reason, detail: $detail, at: $at}])
+  ' --arg id "$1" --arg reason "$2" --arg detail "$detail" \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+attempt_count() { # $1 id
+  jq --arg id "$1" '[(.issues // [])[] | select(.id == $id) | (.attempts // [])[]] | length' "$SPEC"
+}
+
+# The gate. A DONE promise is a claim; this is the check. Runs in the loop's cwd,
+# which is the same cwd claude just worked in.
+VERIFY_FAILURE=
+run_verification() {
+  local cmd out status
+  VERIFY_FAILURE=
+
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    printf '%s ⋯%s %s%s%s\n' "$DIM" "$RESET" "$DIM" "$(trunc "$cmd" $((WIDTH - 8)))" "$RESET"
+
+    set +e
+    out=$(bash -c "$cmd" 2>&1)
+    status=$?
+    set -e
+
+    if [ "$status" -ne 0 ]; then
+      printf '%s ✖%s %s%s%s %s(exit %s)%s\n' "$RED" "$RESET" "$FG" "$cmd" "$RESET" "$DIM" "$status" "$RESET"
+      printf '%s' "$out" | tail -15 | while IFS= read -r l; do
+        printf '   %s%s%s\n' "$DIM" "$(trunc "$l" $((WIDTH - 6)))" "$RESET"
+      done
+      VERIFY_FAILURE="$cmd (exit $status)"
+      local tail_out
+      tail_out=$(printf '%s' "$out" | tail -3 | tr '\n' ' ')
+      [ -n "${tail_out//[[:space:]]/}" ] && VERIFY_FAILURE="$VERIFY_FAILURE — $tail_out"
+
+      # The prompt only ever sees a 3-line tail; the full output is what a
+      # retry actually needs to diagnose a failure it didn't cause.
+      if [ "$MODE" = spec ] && [ -n "$ISSUE_ID" ]; then
+        local log_name
+        log_name="$ISSUE_ID-$(($(attempt_count "$ISSUE_ID") + 1)).log"
+        mkdir -p "$SPEC_DIR/attempts"
+        printf '%s' "$out" > "$SPEC_DIR/attempts/$log_name"
+        VERIFY_FAILURE="$VERIFY_FAILURE — full output: attempts/$log_name"
+      fi
+
+      return 1
+    fi
+  done < <(jq -r '(.verification // [])[]' "$SPEC")
+
+  return 0
+}
+
+# A second, independent claude call that reviews the diff against the ticket's
+# criteria with no memory of writing it. Verification only proves the commands
+# in "verification" exit 0; it says nothing about whether the diff actually did
+# what the ticket asked for. Guarded so a judge outage degrades to "trust
+# verification" rather than blocking every iteration.
+JUDGE_REASON=
+# A heredoc apostrophe inside `x=$(cat <<EOF ...)` confuses bash's parser (it
+# tries to balance quotes across the substitution); a separate function whose
+# own stdout is captured sidesteps that.
+judge_prompt() { # $1 criteria bullets, $2 diff
+  cat <<EOF
+You are reviewing a diff against a ticket's acceptance criteria. You did not
+write this code. Judge only what the diff shows — do not assume unstated work
+exists.
+
+Criteria:
+$1
+
+Diff:
+$2
+
+End with exactly one line: VERDICT: PASS  or  VERDICT: FAIL — <which criterion, why>
+EOF
+}
+
+judge_criteria() { # $1 issue id, $2 sha before this iteration
+  local id=$1 before=$2 diff criteria prompt out verdict
+  JUDGE_REASON=
+
+  [ -n "$JUDGE_MODEL" ] || return 0
+  [ "$IS_GIT" -eq 1 ] || return 0
+  [ -n "$before" ] || return 0
+
+  diff=$(git diff "$before"..HEAD 2>/dev/null | head -c 60000)
+  [ -n "$diff" ] || return 0
+
+  criteria=$(jq -r --arg id "$id" '
+    (.issues // [])[] | select(.id == $id) | (.criteria // [])[] | "- " + .
+  ' "$SPEC")
+
+  printf '%s ⋯%s %sreviewing diff against criteria (%s)%s\n' "$DIM" "$RESET" "$DIM" "$JUDGE_MODEL" "$RESET"
+
+  prompt=$(judge_prompt "$criteria" "$diff")
+
+  set +e
+  out=$($CLAUDE_CMD --model "$JUDGE_MODEL" --output-format json -p "$prompt" 2>&1)
+  set -e
+
+  verdict=$(jq -r '.result // ""' <<<"$out" 2>/dev/null || true)
+  [ -n "$verdict" ] || verdict="$out"
+  add_cost "$(jq -r '.total_cost_usd // empty' <<<"$out" 2>/dev/null || true)"
+
+  [[ "$verdict" == *"VERDICT: PASS"* ]] && return 0
+
+  JUDGE_REASON=$(grep -o 'VERDICT: FAIL.*' <<<"$verdict" | head -1)
+  [ -n "$JUDGE_REASON" ] || JUDGE_REASON="judge returned no verdict"
+  return 1
 }
 
 render_board() { # $1 issues json, $2 iteration, $3 status line
@@ -450,7 +681,7 @@ render_board() { # $1 issues json, $2 iteration, $3 status line
   done < <(jq -r '.[] | [.number, .title, .state, .wait] | join("")' <<<"$board")
 
   box_sep
-  box_line "${YELLOW}⟳${RESET} ${FG}iteration ${BOLD}${iter}${RESET}${DIM}/${MAX_ITERATIONS}${RESET}   ${MODEL_COLOR}◈ ${MODEL_LABEL}${RESET}   ${status}"
+  box_line "${YELLOW}⟳${RESET} ${FG}iteration ${BOLD}${iter}${RESET}${DIM}/${MAX_ITERATIONS}${RESET}   ${MODEL_COLOR}◈ ${MODEL_LABEL}${RESET}$(cost_chip)   ${status}"
   box_bottom
   printf '\n'
 }
@@ -473,6 +704,13 @@ spec_preamble() {
        "", "Already delivered by earlier iterations:",
        (.ledger[] | "- \(.id): \(.outcome)") else empty end)
   ' "$SPEC"
+
+  # Repo-level scratchpad the agent writes to itself (see the NOTES.md rule in
+  # build_prompt) — not part of spec.json, so it's read from disk here instead
+  # of via jq.
+  if [ -s "$SPEC_DIR/NOTES.md" ]; then
+    printf '\nRepo-level notes left by earlier iterations:\n%s\n' "$(tail_notes "$SPEC_DIR/NOTES.md" "$NOTES_CAP")"
+  fi
 }
 
 issue_block() { # $1 id
@@ -485,35 +723,157 @@ issue_block() { # $1 id
       (if (($i.files // []) | length) > 0 then
          "", "Start from: " + ($i.files | join(", ")) else empty end),
       (if ((.verification // []) | length) > 0 then
-         "", "Must pass before you finish: " + (.verification | join(" && ")) else empty end)
+         "", "Must pass before you finish: " + (.verification | join(" && ")),
+         "The loop runs these itself after you report done; promising DONE while",
+         "they fail does not complete the ticket." else empty end),
+      (if ((($i.attempts // []) | length) > 0) then
+         "",
+         "This ticket has been attempted before and did not complete:",
+         (($i.attempts // []) | .[-2:][]
+          | "- \(.reason)\(if (.detail // "") == "" then "" else ": " + .detail end)"),
+         "Do not repeat those approaches. If the ticket cannot be built as written,",
+         "say so in a BLOCKED promise rather than trying again the same way."
+       else empty end)
   ' "$SPEC"
 }
 
+BLOCKER_NOTES_CAP=1500
+NOTES_CAP=2000
+
+# Last $2 characters of $1, but never starting mid-line: the byte cut from
+# `tail -c` can land inside a line, so the partial first line is dropped once
+# the file is actually larger than the cap.
+tail_notes() { # $1 path, $2 cap
+  local path=$1 cap=$2 size
+  size=$(wc -c <"$path" 2>/dev/null | tr -d ' ')
+  if [ -n "$size" ] && [ "$size" -gt "$cap" ]; then
+    tail -c "$cap" "$path" | tail -n +2
+  else
+    cat "$path"
+  fi
+}
+
+# The agent is asked to leave notes under "## Comments" for whoever builds on its
+# work. This is who reads them: the direct blockers only. The ledger already
+# carries a one-liner for every finished issue, so walking the full transitive
+# closure would buy repetition at a cost that grows with graph depth.
+blocker_notes() { # $1 id
+  local blocker body path notes out= total=0
+
+  while IFS= read -r blocker; do
+    [ -n "$blocker" ] || continue
+
+    body=$(jq -r --arg b "$blocker" '
+      (.issues // [])[] | select(.id == $b and .status == "done") | (.body // "")
+    ' "$SPEC")
+    [ -n "$body" ] || continue
+
+    path="$SPEC_DIR/$body"
+    [ -f "$path" ] || continue
+
+    # everything after the "## Comments" heading, with leading and trailing blank
+    # lines dropped and interior ones kept
+    notes=$(awk '
+      /^## Comments[[:space:]]*$/ { f = 1; next }
+      !f                          { next }
+      /^[[:space:]]*$/            { if (n) blank++; next }
+                                  { while (blank-- > 0) line[n++] = ""; blank = 0
+                                    line[n++] = $0 }
+      END                         { for (i = 0; i < n; i++) print line[i] }
+    ' "$path")
+    [ -n "${notes//[[:space:]]/}" ] || continue
+
+    if [ "$((total + ${#notes}))" -gt "$BLOCKER_NOTES_CAP" ]; then
+      notes="${notes:0:$((BLOCKER_NOTES_CAP - total))}
+… (truncated; full notes in $path)"
+    fi
+
+    out="$out[$blocker]
+$notes
+
+"
+    total=$((total + ${#notes}))
+    [ "$total" -ge "$BLOCKER_NOTES_CAP" ] && break
+  done < <(jq -r --arg id "$1" '(.issues // [])[] | select(.id == $id) | (.blocked_by // [])[]' "$SPEC")
+
+  [ -n "$out" ] || return 0
+  printf 'Notes left by the tickets this one depends on:\n\n%s' "$out"
+}
+
 build_prompt() { # $1 id, $2 body path (may be empty)
-  local id=$1 body=$2 rationale=
+  local id=$1 body=$2 rationale= notes= attempts_note= dirty_note= context_note=
+  local has_attempts=0
 
   [ -n "$body" ] && [ -f "$SPEC_DIR/$body" ] && rationale=$(cat "$SPEC_DIR/$body")
+  notes=$(blocker_notes "$id")
+  [ "$(attempt_count "$id")" -gt 0 ] && has_attempts=1
+
+  # A prior attempt's full verification output only exists on disk once
+  # run_verification has written one; point at it instead of duplicating it here.
+  if [ "$has_attempts" -eq 1 ] && [ -d "$SPEC_DIR/attempts" ]; then
+    attempts_note="Full logs for earlier attempts live under $SPEC_DIR/attempts/ — read
+them before choosing an approach."
+  fi
+
+  # An agent that crashed mid-edit, or a previous failed attempt, can leave the
+  # tree dirty. Silence here reads as "this is fine to build on," which is only
+  # true half the time.
+  if [ "$IS_GIT" -eq 1 ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    if [ "$has_attempts" -eq 1 ]; then
+      dirty_note="The working tree already has uncommitted changes, likely a prior failed
+attempt at this same ticket. Review them with git status/git diff, keep what
+is useful, revert what is not — do not assume they are correct."
+    else
+      dirty_note="The working tree has uncommitted changes unrelated to this ticket. Leave
+them alone; do not commit them as part of this ticket's work."
+    fi
+  fi
+
+  [ -f "$SPEC_DIR/context.md" ] && context_note="Background for the whole effort (research, provenance, rejected alternatives)
+is at $SPEC_DIR/context.md — read it only if this ticket's rationale seems to
+conflict with the invariants or you need provenance."
+
+  local -a rules=(
+    "Implement ONLY this ticket. The effort's other tickets are deliberately not
+   shown to you; do not go looking for them, and do not build ahead."
+    "Run the verification commands above, plus this repo's type checks, before
+   you finish. Report failures rather than working around them."
+  )
+  [ "$IS_GIT" -eq 1 ] && rules+=("Before implementing, skim \`git log --oneline -15\` to see what recent
+   iterations changed.")
+  [ -n "$body" ] && rules+=("Append a short note under the \"## Comments\" heading of $SPEC_DIR/$body:
+   what you did, and any decision a later ticket needs to know about.")
+  rules+=("Append any repo-level discovery a later ticket would need (build quirks,
+   required env vars, patterns to follow) as one-line bullets to
+   $SPEC_DIR/NOTES.md. Seam-level notes about this ticket go under its
+   \"## Comments\" heading instead.")
+  rules+=("Commit your work, referencing the ticket id \"$id\" in the message.")
+  rules+=("Do NOT edit $SPEC. The loop owns issue status and the ledger.")
+
+  local rules_text= n=1 rule
+  for rule in "${rules[@]}"; do
+    rules_text="${rules_text}${n}. ${rule}
+"
+    n=$((n + 1))
+  done
 
   cat <<EOF
 $(spec_preamble)
-
+${notes:+
+$notes}
 ────────────────────────────────────────
-$(issue_block "$id")
+$(issue_block "$id")${attempts_note:+
+$attempts_note}
 ${rationale:+
 $rationale
-}
-────────────────────────────────────────
+}${dirty_note:+
+$dirty_note
+}${context_note:+
+$context_note
+}────────────────────────────────────────
 
 Rules for this iteration:
-1. Implement ONLY this ticket. The effort's other tickets are deliberately not
-   shown to you; do not go looking for them, and do not build ahead.
-2. Run the verification commands above, plus this repo's type checks, before
-   you finish. Report failures rather than working around them.${body:+
-3. Append a short note under the "## Comments" heading of $SPEC_DIR/$body: what
-   you did, and any decision a later ticket needs to know about.}
-$([ -n "$body" ] && echo 4 || echo 3). Commit your work, referencing the ticket id "$id" in the message.
-$([ -n "$body" ] && echo 5 || echo 4). Do NOT edit $SPEC. The loop owns issue status and the ledger.
-
+$rules_text
 End your final message with exactly one of these, on its own line:
   <promise>DONE:$id — one line naming what now exists, for the ledger</promise>
   <promise>BLOCKED:$id — what stopped you</promise>
@@ -537,6 +897,10 @@ fi
 START=$(date +%s)
 
 for ((i = 1; i <= MAX_ITERATIONS; i++)); do
+  # Set once actionable failure feedback is recorded on the issue (verification
+  # or criteria review), so the stall guard below can tell that apart from an
+  # iteration that produced nothing at all.
+  FEEDBACK=0
   BOARD=$(issues)
   TOTAL=$(jq 'length' <<<"$BOARD")
 
@@ -548,8 +912,15 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
 
   if [ "$OPEN" -eq 0 ]; then
     render_board "$BOARD" "$((i - 1))" "${GREEN}${BOLD}all issues done${RESET}"
-    printf '%s✔%s  %sDone%s in %s%s%s after %s iteration(s).\n\n' \
-      "$GREEN" "$RESET" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$((i - 1))"
+    printf '%s✔%s  %sDone%s in %s%s%s after %s iteration(s).%s\n\n' \
+      "$GREEN" "$RESET" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$((i - 1))" "$(spend_note)"
+    exit 0
+  fi
+
+  if over_budget; then
+    render_board "$BOARD" "$((i - 1))" "${YELLOW}${BOLD}cost ceiling reached${RESET}"
+    printf '%s◆%s  Stopped at %s$%s%s of the %s$%s%s ceiling; %s issue(s) still open.\n\n' \
+      "$CYAN" "$RESET" "$TEAL" "$SPENT" "$RESET" "$TEAL" "$MAX_COST" "$RESET" "$OPEN"
     exit 0
   fi
 
@@ -562,7 +933,38 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     # `|| true`: an empty frontier makes read fail, and set -e would kill the
     # run before the diagnostic below explains why
     IFS=$'\037' read -r ISSUE_ID ISSUE_BODY ISSUE_MODEL ISSUE_TITLE < <(next_issue) || true
+
+    # Per-issue circuit breaker. The global stall guard can't tell "two issues
+    # each stumbled once" from "one issue has failed three times"; this can, and
+    # the second case is never fixed by trying again.
+    TRIES=0
+    if [ -n "$ISSUE_ID" ]; then
+      TRIES=$(attempt_count "$ISSUE_ID")
+      if [ "$TRIES" -ge "$ISSUE_ATTEMPT_LIMIT" ]; then
+        printf '\n%s✖%s  %s%s%s has failed %s time(s) — at the limit of %s.\n\n' \
+          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$TRIES" "$ISSUE_ATTEMPT_LIMIT" >&2
+        jq -r --arg id "$ISSUE_ID" '
+          (.issues // [])[] | select(.id == $id) | (.attempts // [])[]
+          | "   · \(.reason)\(if (.detail // "") == "" then "" else ": " + .detail end)"
+        ' "$SPEC" >&2
+        printf '\n   %sThe ticket is probably wrong, not the attempts. In Claude Code, run\n' "$DIM" >&2
+        printf '   /to-issues %s --replan %s to rewrite or split it from the attempt\n' "$SPEC_DIR" "$ISSUE_ID" >&2
+        printf '   record (it clears attempts on what it rewrites), then rerun the loop.\n' >&2
+        printf '   Hand-editing criteria and clearing "attempts" yourself also works.%s\n\n' "$RESET" >&2
+        exit 1
+      fi
+    fi
+
     use_model "${ISSUE_MODEL:-$MODEL}"
+
+    # Opt-in: a ticket that already failed gets a stronger model next time round.
+    # Only from a named tier — there is nothing to escalate an unnamed default from.
+    if [ "$ESCALATE" = 1 ] && [ "${TRIES:-0}" -gt 0 ]; then
+      case "$MODEL_LABEL" in
+        haiku)  use_model sonnet ;;
+        sonnet) use_model opus ;;
+      esac
+    fi
   fi
 
   render_board "$BOARD" "$i" "${DIM}${OPEN} open${RESET}"
@@ -597,6 +999,7 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
   # iteration with backoff. The spec holds the state, so a retry is safe.
   RESULT=
   ATTEMPT=1
+  HEAD_BEFORE=$(head_sha)
   while :; do
     ITER_START=$(date +%s)
     OUT=$(mktemp)
@@ -621,7 +1024,13 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
     [ -z "$RESULT" ] && RESULT="$RAW"
     IS_ERROR=$(jq -Rr 'fromjson? | select(.type == "result") | (.is_error // false)' <<<"$RAW" 2>/dev/null | tail -1)
 
-    printf '%s ╰─ %s%s%s\n' "$DIM" "$ORANGE" "$(hms $(($(date +%s) - ITER_START)))" "$RESET"
+    # Retries cost money too, so this accumulates per attempt, not per iteration.
+    # `// empty` so a transcript without the field degrades to zero rather than
+    # taking the loop down.
+    add_cost "$(jq -Rr 'fromjson? | select(.type == "result") | (.total_cost_usd // empty)' \
+                 <<<"$RAW" 2>/dev/null | tail -1)"
+
+    printf '%s ╰─ %s%s%s%s\n' "$DIM" "$ORANGE" "$(hms $(($(date +%s) - ITER_START)))" "$RESET" "$(cost_chip)"
 
     # claude sometimes prints an API error and still exits 0
     if [ "$STATUS" -eq 0 ] && [ "$IS_ERROR" != "true" ] && [[ "$RAW" != *"API Error"* ]]; then
@@ -633,7 +1042,10 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
 
     if [ "$ATTEMPT" -gt "$RETRIES" ]; then
       printf '\n%s✖%s  claude failed (%s) on iteration %s after %s retries.\n' "$RED" "$RESET" "$REASON" "$i" "$RETRIES" >&2
-      printf '   %sNothing was committed by the failed attempt; rerun to resume.%s\n\n' "$DIM" "$RESET" >&2
+      [ "$MODE" = spec ] && [ -n "$ISSUE_ID" ] && record_attempt "$ISSUE_ID" "run failed" "$REASON"
+      report_commits "$HEAD_BEFORE" >&2
+      printf '   %sRerun to resume; %s is still claimed and will be re-picked.%s\n\n' \
+        "$DIM" "${ISSUE_ID:-the open issue}" "$RESET" >&2
       exit 1
     fi
 
@@ -646,8 +1058,8 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
   if [ "$MODE" = gh ]; then
     if [[ "$RESULT" == *"<promise>COMPLETE</promise>"* ]]; then
       render_board "$(issues)" "$i" "${GREEN}${BOLD}COMPLETE${RESET}"
-      printf '%s✔%s  %s %scomplete%s in %s%s%s after %s iteration(s).\n\n' \
-        "$GREEN" "$RESET" "$BOARD_LABEL" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$i"
+      printf '%s✔%s  %s %scomplete%s in %s%s%s after %s iteration(s).%s\n\n' \
+        "$GREEN" "$RESET" "$BOARD_LABEL" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$i" "$(spend_note)"
       exit 0
     fi
   else
@@ -657,7 +1069,10 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       printf '\n%s✖%s  %s reported blocked on %s%s%s:\n\n' \
         "$RED" "$RESET" "claude" "$BOLD" "$ISSUE_ID" "$RESET" >&2
       print_message "$RESULT" >&2
-      printf '\n   %sspec.json is unchanged apart from status=claimed on %s.%s\n\n' "$DIM" "$ISSUE_ID" "$RESET" >&2
+      printf '\n' >&2
+      record_attempt "$ISSUE_ID" "reported blocked" "$RESULT"
+      report_commits "$HEAD_BEFORE" >&2
+      printf '   %s%s stays claimed; nothing was added to the ledger.%s\n\n' "$DIM" "$ISSUE_ID" "$RESET" >&2
       exit 1
     fi
 
@@ -669,26 +1084,56 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       if [ "$DONE_ID" != "$ISSUE_ID" ]; then
         printf '%s ⚠%s  promise names %q but the assigned ticket was %q — not recording it.\n' \
           "$YELLOW" "$RESET" "$DONE_ID" "$ISSUE_ID"
+      # The promise is a claim; the spec's verification commands are the check.
+      # Failing here leaves the issue claimed, so the next pass re-picks it with
+      # the failure replayed into its prompt.
+      elif ! run_verification; then
+        printf '%s ✖%s %s%s%s  %spromised done, but verification failed — not recording it%s\n' \
+          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+        record_attempt "$ISSUE_ID" "verification failed" "$VERIFY_FAILURE"
+        FEEDBACK=1
+      # Verification proves the checks pass; it says nothing about whether the
+      # diff did what the ticket asked. A fresh context with no stake in its own
+      # work is the closest a single model gets to reviewing that honestly.
+      elif ! judge_criteria "$ISSUE_ID" "$HEAD_BEFORE"; then
+        printf '%s ✖%s %s%s%s  %sdiff failed criteria review — not recording it%s\n' \
+          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+        record_attempt "$ISSUE_ID" "criteria review failed" "$JUDGE_REASON"
+        FEEDBACK=1
       else
-        finish_issue "$ISSUE_ID" "$OUTCOME"
+        HEAD_AFTER=$(head_sha)
+        if [ "$IS_GIT" -eq 1 ] && [ -n "$HEAD_BEFORE" ] && [ "$HEAD_AFTER" = "$HEAD_BEFORE" ]; then
+          printf '%s ⚠%s  %s committed nothing — the work is only in the working tree.\n' \
+            "$YELLOW" "$RESET" "$ISSUE_ID"
+          HEAD_AFTER=
+        fi
+        finish_issue "$ISSUE_ID" "$OUTCOME" "$HEAD_AFTER"
         printf '%s ✔%s %s%s%s  %s%s%s\n' "$GREEN" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$OUTCOME" "$RESET"
       fi
+    else
+      record_attempt "$ISSUE_ID" "no completion promise" "$(printf '%s' "$RESULT" | tail -c 300)"
     fi
   fi
 
-  # An iteration that finishes nothing means claude is stuck (blocked on
-  # permissions, missing context, …). Repeating it just burns the cap, so
-  # surface what it said and stop.
+  # An iteration that finishes nothing usually means claude is stuck (blocked
+  # on permissions, missing context, …), and repeating it just burns the cap.
+  # But a recorded verification/review failure is not that — it's the per-issue
+  # circuit breaker's job to decide when that issue has failed too many times,
+  # with a diagnostic ("the ticket is probably wrong") this guard can't give.
   OPEN_AFTER=$(jq '[.[] | select(.state != "done")] | length' <<<"$(issues)")
   if [ "$OPEN_AFTER" -ge "$OPEN" ]; then
-    NO_PROGRESS=$((NO_PROGRESS + 1))
-    printf '%s ⚠%s  nothing was completed this iteration (%s/%s)\n' "$YELLOW" "$RESET" "$NO_PROGRESS" "$STALL_LIMIT"
-    if [ "$NO_PROGRESS" -ge "$STALL_LIMIT" ]; then
-      printf '\n%s✖%s  Stalled: %s iteration(s) completed nothing. claude'"'"'s last message:\n\n' \
-        "$RED" "$RESET" "$NO_PROGRESS" >&2
-      print_message "$RESULT" >&2
-      printf '\n' >&2
-      exit 1
+    if [ "$FEEDBACK" -eq 1 ]; then
+      printf '%s ⋯%s the failure was recorded on the issue; the per-issue attempt limit governs retries%s\n' "$DIM" "$RESET" "$RESET"
+    else
+      NO_PROGRESS=$((NO_PROGRESS + 1))
+      printf '%s ⚠%s  nothing was completed this iteration (%s/%s)\n' "$YELLOW" "$RESET" "$NO_PROGRESS" "$STALL_LIMIT"
+      if [ "$NO_PROGRESS" -ge "$STALL_LIMIT" ]; then
+        printf '\n%s✖%s  Stalled: %s iteration(s) completed nothing. claude'"'"'s last message:\n\n' \
+          "$RED" "$RESET" "$NO_PROGRESS" >&2
+        print_message "$RESULT" >&2
+        printf '\n' >&2
+        exit 1
+      fi
     fi
   else
     NO_PROGRESS=0
@@ -700,8 +1145,8 @@ FINAL_OPEN=$(jq '[.[] | select(.state != "done")] | length' <<<"$FINAL")
 
 if [ "$FINAL_OPEN" -eq 0 ]; then
   render_board "$FINAL" "$MAX_ITERATIONS" "${GREEN}${BOLD}all issues done${RESET}"
-  printf '%s✔%s  %sDone%s in %s%s%s after %s iteration(s).\n\n' \
-    "$GREEN" "$RESET" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$MAX_ITERATIONS"
+  printf '%s✔%s  %sDone%s in %s%s%s after %s iteration(s).%s\n\n' \
+    "$GREEN" "$RESET" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$MAX_ITERATIONS" "$(spend_note)"
   exit 0
 fi
 
@@ -709,12 +1154,12 @@ fi
 # default runaway guard is worth an error.
 if [ -n "$ITERATIONS" ]; then
   render_board "$FINAL" "$MAX_ITERATIONS" "${YELLOW}${BOLD}${MAX_ITERATIONS} iteration(s) done${RESET}"
-  printf '%s◆%s  Ran the requested %s iteration(s) in %s%s%s; %s issue(s) still open.\n\n' \
-    "$CYAN" "$RESET" "$MAX_ITERATIONS" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$FINAL_OPEN"
+  printf '%s◆%s  Ran the requested %s iteration(s) in %s%s%s; %s issue(s) still open.%s\n\n' \
+    "$CYAN" "$RESET" "$MAX_ITERATIONS" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$FINAL_OPEN" "$(spend_note)"
   exit 0
 fi
 
 render_board "$FINAL" "$MAX_ITERATIONS" "${RED}${BOLD}iteration cap reached${RESET}"
-printf '%s✖%s  Stopped after %s iterations; %s issue(s) still open.\n\n' \
-  "$RED" "$RESET" "$MAX_ITERATIONS" "$FINAL_OPEN" >&2
+printf '%s✖%s  Stopped after %s iterations; %s issue(s) still open.%s\n\n' \
+  "$RED" "$RESET" "$MAX_ITERATIONS" "$FINAL_OPEN" "$(spend_note)" >&2
 exit 1

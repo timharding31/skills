@@ -13,17 +13,18 @@ The output is consumed by [`~/.claude/scripts/loop.sh`](../../scripts/loop.sh), 
 
 Schema: [resources/spec.schema.json](resources/spec.schema.json). Read it before writing.
 
-Some fields are injected into **every** loop iteration; the rest are read once, by humans and by `/to-issues`. Getting a field on the wrong side of that line is the main way this skill fails.
+Fields split three ways: injected into **every** loop iteration, available **on demand** (pointed at from the prompt, read only if needed), or **read once**, by humans and by `/to-issues`. Getting a field on the wrong side of that line is the main way this skill fails.
 
-| Injected every iteration | Read once |
-| --- | --- |
-| `title`, `summary` | `context` |
-| `invariants` | `open_questions` |
-| `out_of_scope` | |
-| `verification` | |
-| `ledger` (grows as work completes) | |
+| Injected every iteration | Available on demand | Read once |
+| --- | --- | --- |
+| `title`, `summary` | `<spec-dir>/context.md` | `context` (short background) |
+| `invariants` | `<spec-dir>/attempts/*.log` | `open_questions` |
+| `out_of_scope` | | |
+| `verification` | | |
+| `ledger` (grows as work completes) | | |
+| tail of `<spec-dir>/NOTES.md` | | |
 
-So: `summary` is 1–3 sentences, not an essay. `context` is where the essay goes. If you find yourself writing background into `summary`, move it.
+So: `summary` is 1–3 sentences, not an essay. Long-form background goes to `context.md` instead, where `loop.sh` can point an iteration at it without injecting it. If you find yourself writing background into `summary`, move it.
 
 ## Hard rules
 
@@ -69,7 +70,9 @@ Aim for 3–6. Every invariant is paid for on every iteration, so a weak one is 
 
 **`verification`** — the exact shell commands that must pass. Read the repo's scripts; don't guess at `npm test`.
 
-**`context`** — everything else. Research findings, provenance, alternatives rejected and why, links. Not injected, so length is free here. `/to-issues` reads it when decomposing.
+`loop.sh` **executes these itself** after the agent reports done, and refuses to record the issue if any of them fails. That makes this the one field where a mistake stops the whole effort rather than degrading it: a command that can't succeed means no issue ever completes, and the run stalls on the first ticket. Verify each one runs green in the repo *before* you write it here. Prefer the narrowest commands that would actually catch a broken slice — a full end-to-end suite re-run on every iteration is slow and, when it's flaky, indistinguishable from a real failure.
+
+**`context`** — everything else. Research findings, provenance, alternatives rejected and why, links. Write it to `<spec-dir>/context.md`, a sibling file, rather than this field: `loop.sh` can point an iteration at a file to read on demand, but not at a field buried inside spec.json, which also holds the `issues` array that implementers must never see. The JSON `context` field is still fine for a short paragraph. `/to-issues` reads whichever exists when decomposing.
 
 ### 5. Validate
 
@@ -87,7 +90,7 @@ Tell the user where the spec landed, summarise the invariants and what you put o
 
 ## Anti-patterns
 
-- **Essay in `summary`.** It gets re-injected forever. Move it to `context`.
+- **Essay in `summary`.** It gets re-injected forever. Move it to `context.md`.
 - **Invariants that are really acceptance criteria.** If it applies to one issue, it belongs on that issue, not here.
 - **Aspirational constraints.** "Keep it fast", "be careful with types" — an agent can't act on these and they dilute the ones it can.
 - **Writing issues.** Not this skill's job. Stop at the context.
