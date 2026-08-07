@@ -22,10 +22,12 @@ Works through a spec one issue per iteration until every issue is done.
 Spec mode reads a spec.json written by /to-spec and /to-issues. The script — not
 the model — picks the next issue (first in array order whose blockers are all
 done), injects only that issue plus the spec's summary/invariants/ledger, and
-records the result. The agent never edits spec.json.
+records the result. The agent never edits spec.json — the loop snapshots the
+file before each iteration and reverts (and fails) any iteration that does.
 
 An issue is recorded done only when the agent promises DONE, every command in
-the spec's "verification" array exits 0, AND a clean-context review (a second,
+the spec's "verification" array (plus the issue's own "verification" commands,
+when present) exits 0, AND a clean-context review (a second,
 independent claude call that never saw the implementation) confirms the diff
 meets the ticket's criteria. A promise alone is not enough: the loop runs the
 checks itself. A failed iteration is recorded on the issue and replayed into
@@ -556,9 +558,11 @@ attempt_count() { # $1 id
 }
 
 # The gate. A DONE promise is a claim; this is the check. Runs in the loop's cwd,
-# which is the same cwd claude just worked in.
+# which is the same cwd claude just worked in. Effort-level commands first, then
+# the issue's own — a criterion backed by a per-issue command is checked here
+# deterministically rather than left to the diff review alone.
 VERIFY_FAILURE=
-run_verification() {
+run_verification() { # $1 issue id (may be empty)
   local cmd out status
   VERIFY_FAILURE=
 
@@ -593,7 +597,10 @@ run_verification() {
 
       return 1
     fi
-  done < <(jq -r '(.verification // [])[]' "$SPEC")
+  done < <(jq -r --arg id "${1:-}" '
+    (.verification // [])[],
+    ((.issues // [])[] | select(.id == $id) | (.verification // [])[])
+  ' "$SPEC")
 
   return 0
 }
@@ -627,6 +634,9 @@ EOF
   [ -n "$4" ] && printf '\n%s\n' "$4"
 
   cat <<EOF
+
+A diff that deletes, skips, or weakens existing tests to satisfy the criteria
+FAILS, unless a criterion explicitly calls for that change.
 
 Diff:
 $3
@@ -753,8 +763,9 @@ issue_block() { # $1 id
       ($i.criteria[] | "- " + .),
       (if (($i.files // []) | length) > 0 then
          "", "Start from: " + ($i.files | join(", ")) else empty end),
-      (if ((.verification // []) | length) > 0 then
-         "", "Must pass before you finish: " + (.verification | join(" && ")),
+      (((.verification // []) + ($i.verification // [])) as $checks
+       | if ($checks | length) > 0 then
+         "", "Must pass before you finish: " + ($checks | join(" && ")),
          "The loop runs these itself after you report done; promising DONE while",
          "they fail does not complete the ticket." else empty end),
       (if ((($i.attempts // []) | length) > 0) then
@@ -869,6 +880,10 @@ conflict with the invariants or you need provenance."
    shown to you; do not go looking for them, and do not build ahead."
     "Run the verification commands above, plus this repo's type checks, before
    you finish. Report failures rather than working around them."
+    "Never weaken, skip, or delete an existing test to get to green. When this
+   ticket legitimately changes behavior a test asserts, update the test and say
+   why in the commit message; otherwise a failing test is a failure to report,
+   not an obstacle to remove."
   )
   [ "$IS_GIT" -eq 1 ] && rules+=("Before implementing, skim \`git log --oneline -15\` to see what recent
    iterations changed.")
@@ -879,7 +894,9 @@ conflict with the invariants or you need provenance."
    $SPEC_DIR/NOTES.md. Seam-level notes about this ticket go under its
    \"## Comments\" heading instead.")
   rules+=("Commit your work, referencing the ticket id \"$id\" in the message.")
-  rules+=("Do NOT edit $SPEC. The loop owns issue status and the ledger.")
+  rules+=("Do NOT edit $SPEC. The loop owns issue status and the ledger, snapshots
+   the file before you start, and reverts any change you make to it — an edited
+   spec fails the attempt outright.")
 
   local rules_text= n=1 rule
   for rule in "${rules[@]}"; do
@@ -1034,6 +1051,14 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
   RESULT=
   ATTEMPT=1
   HEAD_BEFORE=$(head_sha)
+  # "Do NOT edit $SPEC" is enforced, not trusted: criteria, verification, and
+  # status all live in spec.json, and /specs/* is usually gitignored, so an
+  # agent edit (weakened criteria, dropped checks) would otherwise be invisible.
+  SPEC_SNAPSHOT=
+  if [ "$MODE" = spec ]; then
+    SPEC_SNAPSHOT=$(mktemp)
+    cp "$SPEC" "$SPEC_SNAPSHOT"
+  fi
   while :; do
     ITER_START=$(date +%s)
     OUT=$(mktemp)
@@ -1097,9 +1122,19 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       exit 0
     fi
   else
+    # A rewritten spec.json invalidates every gate below it — the criteria the
+    # judge reads and the commands run_verification runs both live there.
+    # Revert it and fail the attempt; the promise is not worth parsing.
+    if [ -n "$SPEC_SNAPSHOT" ] && ! cmp -s "$SPEC_SNAPSHOT" "$SPEC"; then
+      cp "$SPEC_SNAPSHOT" "$SPEC"
+      printf '%s ✖%s %s%s%s  %sedited spec.json — reverted, promise discarded%s\n' \
+        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+      record_attempt "$ISSUE_ID" "edited the spec" \
+        "the iteration modified spec.json, which the loop owns; it was reverted and the promise discarded"
+      FEEDBACK=1
     # An explicit BLOCKED is the agent telling us the graph is wrong or the
     # ticket is unbuildable. Retrying that burns the cap for nothing.
-    if [[ "$RESULT" =~ \<promise\>BLOCKED:[[:space:]]*([A-Za-z0-9_-]+)[^\<]*\</promise\> ]]; then
+    elif [[ "$RESULT" =~ \<promise\>BLOCKED:[[:space:]]*([A-Za-z0-9_-]+)[^\<]*\</promise\> ]]; then
       printf '\n%s✖%s  %s reported blocked on %s%s%s:\n\n' \
         "$RED" "$RESET" "claude" "$BOLD" "$ISSUE_ID" "$RESET" >&2
       print_message "$RESULT" >&2
@@ -1108,9 +1143,7 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       report_commits "$HEAD_BEFORE" >&2
       printf '   %s%s stays claimed; nothing was added to the ledger.%s\n\n' "$DIM" "$ISSUE_ID" "$RESET" >&2
       exit 1
-    fi
-
-    if [[ "$RESULT" =~ \<promise\>DONE:[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[^A-Za-z0-9\<]*([^\<]*)\</promise\> ]]; then
+    elif [[ "$RESULT" =~ \<promise\>DONE:[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[^A-Za-z0-9\<]*([^\<]*)\</promise\> ]]; then
       DONE_ID="${BASH_REMATCH[1]}"
       OUTCOME=$(printf '%s' "${BASH_REMATCH[2]}" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
       [ -n "$OUTCOME" ] || OUTCOME="completed"
@@ -1121,7 +1154,7 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       # The promise is a claim; the spec's verification commands are the check.
       # Failing here leaves the issue claimed, so the next pass re-picks it with
       # the failure replayed into its prompt.
-      elif ! run_verification; then
+      elif ! run_verification "$ISSUE_ID"; then
         printf '%s ✖%s %s%s%s  %spromised done, but verification failed — not recording it%s\n' \
           "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
         record_attempt "$ISSUE_ID" "verification failed" "$VERIFY_FAILURE"
@@ -1152,6 +1185,8 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       record_attempt "$ISSUE_ID" "no completion promise" "$(printf '%s' "$RESULT" | tail -c 300)"
     fi
   fi
+
+  if [ -n "$SPEC_SNAPSHOT" ]; then rm -f "$SPEC_SNAPSHOT"; SPEC_SNAPSHOT=; fi
 
   # An iteration that finishes nothing usually means claude is stuck (blocked
   # on permissions, missing context, …), and repeating it just burns the cap.

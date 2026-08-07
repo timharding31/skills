@@ -17,7 +17,7 @@ Three consequences that shape everything below:
 
 1. **The script picks, not the model.** It takes the first issue in array order whose `blocked_by` are all done. **Array order is priority order** — put them in the order you want them built.
 2. **An issue must be implementable from its own body plus the spec's invariants.** No "as discussed in the previous ticket", no cross-references to siblings. What a later issue needs from an earlier one arrives through the `ledger` and through its blockers' `## Comments`, both of which the loop carries automatically — you never author either.
-3. **Criteria must be provable from the diff, not from intent.** After verification passes, a clean-context reviewer — a fresh model sharing no context with the implementer — judges the iteration's git diff against that issue's `criteria` and can reject the DONE if the diff doesn't satisfy them. A criterion the diff can't evidence will fail review even when it's true.
+3. **Criteria must be provable from the diff, not from intent.** After verification passes, a clean-context reviewer — a fresh model sharing no context with the implementer — judges the iteration's git diff against that issue's `criteria` and can reject the DONE if the diff doesn't satisfy them. A criterion the diff can't evidence will fail review even when it's true. The stronger move is to not leave a criterion to the reviewer at all: an issue's own `verification` commands are executed by the loop under the same gate as the effort-level ones, so a criterion backed by a named test is checked deterministically.
 
 ## Where each thing lives
 
@@ -27,7 +27,8 @@ Metadata is in JSON, prose is in markdown, and they never duplicate each other.
 | --- | --- |
 | `id`, `title`, `status`, `blocked_by` | Why this slice exists |
 | `criteria` — the definition of done | What the shape of the solution is, and what it must not be |
-| `files` — where to start | Constraints and gotchas specific to this issue |
+| `verification` — the commands that prove the criteria | Constraints and gotchas specific to this issue |
+| `files` — where to start | |
 | | A trailing `## Comments` heading |
 
 The body file carries **no** status line, **no** blocked-by line, and **no** checkbox list. Those were the fragile parts of the old markdown format; they are structured fields now. Duplicating criteria into the body guarantees the two drift.
@@ -77,6 +78,7 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 - `attempts` — **never write this.** Like `status` and `ledger`, it belongs to `loop.sh`, which records each failed iteration there and replays the most recent ones into the next attempt's prompt. The one exception is replanning a stuck issue — see [Replanning a stuck issue](#replanning-a-stuck-issue---replan) below.
 - `blocked_by` — ids only, and only *hard* blockers: this issue cannot be correctly built until that one exists. Do not encode mere preference; a false blocker serialises work that could have been done in any order.
 - `criteria` — observable conditions, each checkable by running something or reading the resulting code. "Replacement level shifts with superflex" is checkable. "Code is clean" is not. Criteria are also what the post-verification diff review judges against, so write each one to be checkable by reading the diff and running the verification commands — not by trusting the implementer's stated intent.
+- `verification` — shell commands specific to this issue, executed by the loop after the effort-level `verification` under the same gate. Whenever a criterion says tests exist or behavior holds, name the command that proves it (`npm test -- src/vorp.spec.ts`) — a deterministic check beats a model reading a diff. Commands must be real and runnable from the repo root; when the criteria name a test file the issue itself creates, the command must still exit non-zero before that file exists (most runners fail on a missing named file, which is what you want). Omit the field when the effort-level commands already cover the issue.
 - `files` — the paths to start from.
 - `model` — **omit unless the user asks for per-issue models.** `"haiku"`, `"sonnet"`, `"opus"`, or `"fable"`; it overrides the model `loop.sh` was launched with, for that iteration only. When they do ask, assign it from the work: mechanical, well-specified edits can take `haiku`; issues carrying the design risk you ordered early take `opus`. Leave it off everywhere you have no reason to differ from the run's default.
 

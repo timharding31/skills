@@ -102,6 +102,11 @@
           "items": { "type": "string", "minLength": 1 },
           "description": "Paths or directories the implementer should start from, to skip a discovery phase."
         },
+        "verification": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Shell commands specific to this issue that must pass before it counts as done ('npm test -- src/vorp.spec.ts'). EXECUTED BY loop.sh after the effort-level verification, under the same gate. Name the tests that prove this issue's criteria — a criterion backed by a command here is checked deterministically instead of only by the clean-context diff review."
+        },
         "model": {
           "enum": ["", "haiku", "sonnet", "opus", "fable"],
           "description": "Model this issue runs on, overriding loop.sh's default (--model, else CLAUDE_MODEL, else whatever claude is configured with). One of \"haiku\", \"sonnet\", \"opus\", or \"fable\"; omit or leave empty to take the default. Set it per issue when a ticket is mechanical enough for haiku or subtle enough to need opus."
