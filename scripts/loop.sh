@@ -14,9 +14,9 @@ Usage: $0 <spec-dir|spec.json|gh-issue-url> [max-iterations] [--model <model>] [
 
 Works through a spec one issue per iteration until every issue is done.
 
-  $0 .scratch/lab-modeling-v2
-  $0 .scratch/lab-modeling-v2/spec.json 10
-  $0 .scratch/lab-modeling-v2 --check     # validate + show the board, run nothing
+  $0 specs/lab-modeling-v2
+  $0 specs/lab-modeling-v2/spec.json 10
+  $0 specs/lab-modeling-v2 --check     # validate + show the board, run nothing
   $0 https://github.com/timharding31/ff-sim/issues/5 --model opus
 
 Spec mode reads a spec.json written by /to-spec and /to-issues. The script — not
@@ -598,7 +598,7 @@ JUDGE_REASON=
 # A heredoc apostrophe inside `x=$(cat <<EOF ...)` confuses bash's parser (it
 # tries to balance quotes across the substitution); a separate function whose
 # own stdout is captured sidesteps that.
-judge_prompt() { # $1 criteria bullets, $2 diff
+judge_prompt() { # $1 criteria bullets, $2 invariants bullets (may be empty), $3 diff, $4 truncation note (may be empty)
   cat <<EOF
 You are reviewing a diff against a ticket's acceptance criteria. You did not
 write this code. Judge only what the diff shows — do not assume unstated work
@@ -606,32 +606,53 @@ exists.
 
 Criteria:
 $1
+EOF
+
+  [ -n "$2" ] && cat <<EOF
+
+Effort-wide invariants — a diff that violates any of these FAILS even when
+every criterion is met:
+$2
+EOF
+
+  [ -n "$4" ] && printf '\n%s\n' "$4"
+
+  cat <<EOF
 
 Diff:
-$2
+$3
 
-End with exactly one line: VERDICT: PASS  or  VERDICT: FAIL — <which criterion, why>
+End with exactly one line: VERDICT: PASS  or  VERDICT: FAIL — <which criterion or invariant, why>
 EOF
 }
 
 judge_criteria() { # $1 issue id, $2 sha before this iteration
-  local id=$1 before=$2 diff criteria prompt out verdict
+  local id=$1 before=$2 diff criteria invariants prompt out verdict trunc_note=
   JUDGE_REASON=
 
   [ -n "$JUDGE_MODEL" ] || return 0
   [ "$IS_GIT" -eq 1 ] || return 0
   [ -n "$before" ] || return 0
 
-  diff=$(git diff "$before"..HEAD 2>/dev/null | head -c 60000)
+  # Read one byte past the cap: its presence proves truncation without ever
+  # holding the full diff in memory.
+  diff=$(git diff "$before"..HEAD 2>/dev/null | head -c 60001)
   [ -n "$diff" ] || return 0
+  if [ "$(printf '%s' "$diff" | wc -c)" -gt 60000 ]; then
+    diff="${diff:0:60000}"
+    trunc_note="NOTE: the diff below is TRUNCATED at 60,000 characters — it is not the whole
+change. Judge what is shown; if a criterion's evidence could plausibly lie
+beyond the cutoff, say so in your verdict rather than failing it outright."
+  fi
 
   criteria=$(jq -r --arg id "$id" '
     (.issues // [])[] | select(.id == $id) | (.criteria // [])[] | "- " + .
   ' "$SPEC")
+  invariants=$(jq -r '(.invariants // [])[] | "- " + .' "$SPEC")
 
   printf '%s ⋯%s %sreviewing diff against criteria (%s)%s\n' "$DIM" "$RESET" "$DIM" "$JUDGE_MODEL" "$RESET"
 
-  prompt=$(judge_prompt "$criteria" "$diff")
+  prompt=$(judge_prompt "$criteria" "$invariants" "$diff" "$trunc_note")
 
   set +e
   out=$($CLAUDE_CMD --model "$JUDGE_MODEL" --output-format json -p "$prompt" 2>&1)
@@ -702,7 +723,8 @@ spec_preamble() {
        (.out_of_scope[] | "- " + .) else empty end),
     (if ((.ledger // []) | length) > 0 then
        "", "Already delivered by earlier iterations:",
-       (.ledger[] | "- \(.id): \(.outcome)") else empty end)
+       (.ledger[] | "- \(.id): \(.outcome)\(if (.commit // "") == "" then "" else " (commit \(.commit[0:7]))" end)")
+     else empty end)
   ' "$SPEC"
 
   # Repo-level scratchpad the agent writes to itself (see the NOTES.md rule in
@@ -1092,6 +1114,15 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
           "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
         record_attempt "$ISSUE_ID" "verification failed" "$VERIFY_FAILURE"
         FEEDBACK=1
+      # No commit means no diff for the judge and nothing traceable in the
+      # ledger — and verification may only be passing off uncommitted work.
+      # That's a failed attempt, not a warning.
+      elif [ "$IS_GIT" -eq 1 ] && [ -n "$HEAD_BEFORE" ] && [ "$(head_sha)" = "$HEAD_BEFORE" ]; then
+        printf '%s ✖%s %s%s%s  %spromised done, but committed nothing — not recording it%s\n' \
+          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+        record_attempt "$ISSUE_ID" "committed nothing" \
+          "the DONE promise requires a commit; any work is only in the working tree"
+        FEEDBACK=1
       # Verification proves the checks pass; it says nothing about whether the
       # diff did what the ticket asked. A fresh context with no stake in its own
       # work is the closest a single model gets to reviewing that honestly.
@@ -1102,11 +1133,6 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
         FEEDBACK=1
       else
         HEAD_AFTER=$(head_sha)
-        if [ "$IS_GIT" -eq 1 ] && [ -n "$HEAD_BEFORE" ] && [ "$HEAD_AFTER" = "$HEAD_BEFORE" ]; then
-          printf '%s ⚠%s  %s committed nothing — the work is only in the working tree.\n' \
-            "$YELLOW" "$RESET" "$ISSUE_ID"
-          HEAD_AFTER=
-        fi
         finish_issue "$ISSUE_ID" "$OUTCOME" "$HEAD_AFTER"
         printf '%s ✔%s %s%s%s  %s%s%s\n' "$GREEN" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$OUTCOME" "$RESET"
       fi

@@ -80,7 +80,33 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 - `files` — the paths to start from.
 - `model` — **omit unless the user asks for per-issue models.** `"haiku"`, `"sonnet"`, `"opus"`, or `"fable"`; it overrides the model `loop.sh` was launched with, for that iteration only. When they do ask, assign it from the work: mechanical, well-specified edits can take `haiku`; issues carrying the design risk you ordered early take `opus`. Leave it off everywhere you have no reason to differ from the run's default.
 
-### 6. Validate
+### 6. Append the final quality-review issue
+
+Unless the user opts out, or the effort has only one issue, the **last** issue in the array is a code-quality review of the whole run:
+
+```json
+{
+  "id": "quality-review",
+  "title": "Post-run code quality review of this effort",
+  "status": "ready",
+  "blocked_by": ["<every other issue id>"],
+  "body": "issues/quality-review.md",
+  "model": "opus",
+  "criteria": [
+    "Every restructuring is in its own commit whose message references quality-review",
+    "No test assertions were weakened, skipped, or deleted",
+    "Findings judged not worth a code change are recorded under the issue's ## Comments"
+  ]
+}
+```
+
+- `blocked_by` lists **every other id** — this is the one issue where a total edge set is correct, so it runs exactly once, after everything.
+- `model: "opus"` is the default and the exception to "omit `model`": ambitious restructuring is the one ticket that earns a stronger model than the run's default. Honor a user's different choice.
+- Keep the criteria falsifiable, as above — "code quality improved" is exactly the unfalsifiable criterion this skill bans, and the loop's judge would have nothing to check.
+
+Body (`issues/quality-review.md`): instruct the implementer to review the effort's *whole* diff — the ledger in its prompt lists each completed issue's short commit SHA; the range is from the parent of the first ledger commit to HEAD. If the `thermo-nuclear-code-quality-review` skill is available, invoke it and adapt it to that local diff (skip its GitLab MR-fetching steps; the review standards apply unchanged). Otherwise carry its core stance inline in the body: be ambitious about structural simplification, hunt for "code judo" moves that make whole branches or layers disappear, preserve behavior exactly, and treat any file crossing 1k lines as a smell. End with the standard `## Comments` heading.
+
+### 7. Validate
 
 ```bash
 ~/.claude/scripts/loop.sh <spec-dir> --check
@@ -88,7 +114,7 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 
 This checks ids are unique, blockers resolve, criteria exist, statuses are legal, every `body` file is on disk, and the graph is acyclic — then prints the board with the blocked chain drawn. A cycle fails validation outright and names the issues that can never become workable.
 
-### 7. Report
+### 8. Report
 
 Show the user the board, name the starting frontier (everything with no blockers), and tell them to run:
 
@@ -99,6 +125,8 @@ Show the user the board, name the starting frontier (everything with no blockers
 ## Re-running on a spec that's already in flight
 
 Never touch `status` on issues that are `done` or `claimed`, and never touch `ledger` — that's execution state and rewriting it loses the record of what was built. Add new issues to the array in the position their priority warrants, and only edit the `criteria` or `body` of issues still `ready`. The one sanctioned exception, for an issue that's stuck rather than merely in flight, is the replan flow below.
+
+**Maintain the quality-review issue's total edge set.** Any issue you add — including issues created by splitting one under `--replan` — must also be appended to `quality-review`'s `blocked_by`, or the review runs before the effort is actually finished.
 
 ## Replanning a stuck issue (--replan)
 

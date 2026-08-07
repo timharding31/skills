@@ -30,8 +30,16 @@ So: `summary` is 1–3 sentences, not an essay. Long-form background goes to `co
 
 - **Do not write `issues`.** This skill produces context only. The user runs `/to-issues` when they're ready to decompose. A spec.json without issues is valid and expected — the loop refuses to run on it and says so.
 - **Do not write `ledger`.** `loop.sh` owns it.
-- **Slug matches the directory.** `.scratch/lab-modeling-v2/spec.json` must have `"slug": "lab-modeling-v2"`.
-- **Default location is `.scratch/<slug>/`** unless the repo documents another convention (check `CLAUDE.md` / `AGENTS.md` for an issue-tracker convention first) or the user names one.
+- **Slug matches the directory.** `specs/lab-modeling-v2/spec.json` must have `"slug": "lab-modeling-v2"`.
+- **Default location is `specs/<slug>/`** unless the repo documents another convention (check `CLAUDE.md` / `AGENTS.md` for an issue-tracker convention first) or the user names one.
+- **Specs are local-only by default in shared repos.** If the repo has other committers and `.gitignore` doesn't already cover `specs/`, add `/specs/*` to it. A spec is opted in by name when the user decides it should ship, with two more lines:
+
+  ```gitignore
+  !/specs/<slug>/
+  /specs/<slug>/attempts/
+  ```
+
+  Use `/specs/*`, never `/specs/` — git does not descend into a fully-ignored directory, so a negation under `/specs/` can never match. Never opt in `attempts/`; those logs are execution debris.
 
 ## Process
 
