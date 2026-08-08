@@ -95,9 +95,8 @@ Unless the user opts out, or the effort has only one issue, the **last** issue i
   "body": "issues/quality-review.md",
   "model": "opus",
   "criteria": [
-    "Every restructuring is in its own commit whose message references quality-review",
-    "No test assertions were weakened, skipped, or deleted",
-    "Findings judged not worth a code change are recorded under the issue's ## Comments"
+    "Every change in the diff is a restructuring: no new features, and no behavior change that an existing test asserts",
+    "No test assertions were weakened, skipped, or deleted"
   ]
 }
 ```
@@ -105,8 +104,11 @@ Unless the user opts out, or the effort has only one issue, the **last** issue i
 - `blocked_by` lists **every other id** — this is the one issue where a total edge set is correct, so it runs exactly once, after everything.
 - `model: "opus"` is the default and the exception to "omit `model`": ambitious restructuring is the one ticket that earns a stronger model than the run's default. Honor a user's different choice.
 - Keep the criteria falsifiable, as above — "code quality improved" is exactly the unfalsifiable criterion this skill bans, and the loop's judge would have nothing to check.
+- Criteria must also be *visible to the judge*, which sees one flattened diff: commit boundaries, commit messages, and anything under gitignored `specs/` (including `## Comments`) never appear in it. Conventions like one-commit-per-restructuring or recording skipped findings belong in the body's instructions, not in `criteria`.
 
-Body (`issues/quality-review.md`): instruct the implementer to review the effort's *whole* diff — the ledger in its prompt lists each completed issue's short commit SHA; the range is from the parent of the first ledger commit to HEAD. If the `thermo-nuclear-code-quality-review` skill is available, invoke it and adapt it to that local diff (skip its GitLab MR-fetching steps; the review standards apply unchanged). Otherwise carry its core stance inline in the body: be ambitious about structural simplification, hunt for "code judo" moves that make whole branches or layers disappear, preserve behavior exactly, and treat any file crossing 1k lines as a smell. End with the standard `## Comments` heading.
+Body (`issues/quality-review.md`): instruct the implementer to review the effort's *whole* diff — the ledger in its prompt lists each completed issue's short commit SHA; the range is from the parent of the first ledger commit to HEAD. If the `thermo-nuclear-code-quality-review` skill is available, invoke it and adapt it to that local diff (skip its GitLab MR-fetching steps; the review standards apply unchanged). Otherwise carry its core stance inline in the body: be ambitious about structural simplification, hunt for "code judo" moves that make whole branches or layers disappear, preserve behavior exactly, and treat any file crossing 1k lines as a smell.
+
+The body must also instruct three closing duties the criteria can't carry (see the judge-visibility bullet above): keep each restructuring in its own commit whose message references quality-review; record findings judged not worth a code change under this issue's `## Comments`; and read `<spec-dir>/NOTES.md`, promoting every bullet that is true of the repo beyond this effort (build quirks, required env vars, conventions to follow) into the repo's CLAUDE.md — or AGENTS.md, if that is the repo's convention. NOTES.md lives in a gitignored directory and dies with the spec; anything left unpromoted is relearned at full price by the next effort. End with the standard `## Comments` heading.
 
 ### 7. Validate
 

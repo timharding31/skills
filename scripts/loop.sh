@@ -25,12 +25,14 @@ done), injects only that issue plus the spec's summary/invariants/ledger, and
 records the result. The agent never edits spec.json — the loop snapshots the
 file before each iteration and reverts (and fails) any iteration that does.
 
-An issue is recorded done only when the agent promises DONE, every command in
+An issue is recorded done only when the agent promises DONE, the iteration's
+work is fully committed (new uncommitted changes fail the attempt — the checks
+test the working tree, but the ledger records the commit), every command in
 the spec's "verification" array (plus the issue's own "verification" commands,
 when present) exits 0, AND a clean-context review (a second,
 independent claude call that never saw the implementation) confirms the diff
 meets the ticket's criteria. A promise alone is not enough: the loop runs the
-checks itself. A failed iteration is recorded on the issue and replayed into
+checks itself, retrying a failing command once so a flaky test doesn't count. A failed iteration is recorded on the issue and replayed into
 the next attempt's prompt, so a fresh context window does not repeat an
 approach that already failed.
 
@@ -54,7 +56,7 @@ Env:
   ISSUE_ATTEMPT_LIMIT
                    stop once one issue has failed this many times (default: 3)
   JUDGE_MODEL      model used for the clean-context criteria review after
-                   verification passes (default: haiku; empty disables it)
+                   verification passes (default: sonnet; empty disables it)
   ESCALATE         set to 1 to bump the model a tier (haiku→sonnet→opus) when
                    retrying an issue that already failed (default: off)
   PERMISSION_MODE  claude --permission-mode (default: auto; the loop needs
@@ -254,7 +256,7 @@ RETRIES="${RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-20}"
 STALL_LIMIT="${STALL_LIMIT:-2}"
 ISSUE_ATTEMPT_LIMIT="${ISSUE_ATTEMPT_LIMIT:-3}"
-JUDGE_MODEL="${JUDGE_MODEL-haiku}"
+JUDGE_MODEL="${JUDGE_MODEL-sonnet}"
 ESCALATE="${ESCALATE:-0}"
 PERMISSION_MODE="${PERMISSION_MODE:-auto}"
 NO_PROGRESS=0
@@ -266,6 +268,23 @@ IS_GIT=0
 git rev-parse --git-dir >/dev/null 2>&1 && IS_GIT=1
 
 head_sha() { [ "$IS_GIT" -eq 1 ] && git rev-parse HEAD 2>/dev/null || true; }
+
+# Paths dirty in the working tree, sorted for comm(1).
+dirty_paths() {
+  [ "$IS_GIT" -eq 1 ] || return 0
+  git status --porcelain 2>/dev/null | cut -c4- | sort
+}
+
+# Paths dirty now that were not dirty when the iteration started. Verification
+# runs against the working tree while the ledger records a commit; anything
+# here means those two states differ — classically a new file the agent
+# created but never git-added, which lets the checks pass on a tree the
+# commit doesn't reproduce. Compared by path, so a file that was already
+# dirty before the iteration never triggers this.
+new_dirt() {
+  [ "$IS_GIT" -eq 1 ] || return 0
+  comm -13 <(printf '%s\n' "$DIRTY_BEFORE") <(dirty_paths)
+}
 
 # What an iteration actually left behind. The old message asserted "nothing was
 # committed" without checking, which is false whenever an agent commits and then
@@ -575,12 +594,26 @@ run_verification() { # $1 issue id (may be empty)
     status=$?
     set -e
 
+    # One immediate retry before a failure counts: a flaky test would otherwise
+    # be recorded as this issue's failed attempt, and the replay would then
+    # warn the next fresh context off an approach that was actually fine.
+    if [ "$status" -ne 0 ]; then
+      printf '%s ⚠%s %s%s exited %s — retrying once in case it is flaky%s\n' \
+        "$YELLOW" "$RESET" "$DIM" "$(trunc "$cmd" $((WIDTH - 40)))" "$status" "$RESET"
+      set +e
+      out=$(bash -c "$cmd" 2>&1)
+      status=$?
+      set -e
+      [ "$status" -eq 0 ] && printf '%s ⚠%s %spassed on retry — that command is flaky%s\n' \
+        "$YELLOW" "$RESET" "$DIM" "$RESET"
+    fi
+
     if [ "$status" -ne 0 ]; then
       printf '%s ✖%s %s%s%s %s(exit %s)%s\n' "$RED" "$RESET" "$FG" "$cmd" "$RESET" "$DIM" "$status" "$RESET"
       printf '%s' "$out" | tail -15 | while IFS= read -r l; do
         printf '   %s%s%s\n' "$DIM" "$(trunc "$l" $((WIDTH - 6)))" "$RESET"
       done
-      VERIFY_FAILURE="$cmd (exit $status)"
+      VERIFY_FAILURE="$cmd (exit $status, failed twice)"
       local tail_out
       tail_out=$(printf '%s' "$out" | tail -3 | tr '\n' ' ')
       [ -n "${tail_out//[[:space:]]/}" ] && VERIFY_FAILURE="$VERIFY_FAILURE — $tail_out"
@@ -646,7 +679,7 @@ EOF
 }
 
 judge_criteria() { # $1 issue id, $2 sha before this iteration
-  local id=$1 before=$2 diff criteria invariants prompt out verdict trunc_note=
+  local id=$1 before=$2 diff stat criteria invariants prompt out verdict trunc_note=
   JUDGE_REASON=
 
   [ -n "$JUDGE_MODEL" ] || return 0
@@ -659,9 +692,18 @@ judge_criteria() { # $1 issue id, $2 sha before this iteration
   [ -n "$diff" ] || return 0
   if [ "$(printf '%s' "$diff" | wc -c)" -gt 60000 ]; then
     diff="${diff:0:60000}"
+    # The file list restores what truncation hides: a touched test or config
+    # file whose hunks fell past the cutoff should draw suspicion, not a pass.
+    stat=$(git diff --stat "$before"..HEAD 2>/dev/null | head -c 4000)
     trunc_note="NOTE: the diff below is TRUNCATED at 60,000 characters — it is not the whole
-change. Judge what is shown; if a criterion's evidence could plausibly lie
-beyond the cutoff, say so in your verdict rather than failing it outright."
+change. Every file it touches:
+
+$stat
+
+Judge what is shown; if a criterion's evidence could plausibly lie beyond the
+cutoff, say so in your verdict rather than failing it outright. But treat a
+test or config file listed above whose changes are not visible below as
+grounds for suspicion, not a pass."
   fi
 
   criteria=$(jq -r --arg id "$id" '
@@ -684,7 +726,13 @@ beyond the cutoff, say so in your verdict rather than failing it outright."
   [[ "$verdict" == *"VERDICT: PASS"* ]] && return 0
 
   JUDGE_REASON=$(grep -o 'VERDICT: FAIL.*' <<<"$verdict" | head -1)
-  [ -n "$JUDGE_REASON" ] || JUDGE_REASON="judge returned no verdict"
+  if [ -z "$JUDGE_REASON" ]; then
+    # No verdict either way means the judge call itself failed (API error,
+    # refusal), not that the diff failed review. Trust verification rather
+    # than burning an attempt toward the circuit breaker on an infra blip.
+    printf '%s ⚠%s  %sjudge returned no verdict — trusting verification%s\n' "$YELLOW" "$RESET" "$DIM" "$RESET"
+    return 0
+  fi
   return 1
 }
 
@@ -1051,6 +1099,7 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
   RESULT=
   ATTEMPT=1
   HEAD_BEFORE=$(head_sha)
+  DIRTY_BEFORE=$(dirty_paths)
   # "Do NOT edit $SPEC" is enforced, not trusted: criteria, verification, and
   # status all live in spec.json, and /specs/* is usually gitignored, so an
   # agent edit (weakened criteria, dropped checks) would otherwise be invisible.
@@ -1151,6 +1200,18 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
       if [ "$DONE_ID" != "$ISSUE_ID" ]; then
         printf '%s ⚠%s  promise names %q but the assigned ticket was %q — not recording it.\n' \
           "$YELLOW" "$RESET" "$DONE_ID" "$ISSUE_ID"
+      # Fresh uncommitted changes mean the tree the checks would test is not
+      # the commit the ledger would record — fail before spending time on
+      # verification that could only certify the wrong state.
+      elif NEW_DIRT=$(new_dirt) && [ -n "$NEW_DIRT" ]; then
+        printf '%s ✖%s %s%s%s  %spromised done, but left new uncommitted changes — not recording it%s\n' \
+          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+        printf '%s\n' "$NEW_DIRT" | head -10 | while IFS= read -r l; do
+          printf '   %s%s%s\n' "$DIM" "$l" "$RESET"
+        done
+        record_attempt "$ISSUE_ID" "left uncommitted changes" \
+          "the working tree gained uncommitted changes the commit lacks ($(printf '%s' "$NEW_DIRT" | tr '\n' ' ')); commit everything the ticket produced"
+        FEEDBACK=1
       # The promise is a claim; the spec's verification commands are the check.
       # Failing here leaves the issue claimed, so the next pass re-picks it with
       # the failure replayed into its prompt.
