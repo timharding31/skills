@@ -56,6 +56,8 @@ Env:
   RETRIES          retries per iteration on API errors (default: 3)
   RETRY_DELAY      base backoff seconds, multiplied per attempt (default: 20)
   STALL_LIMIT      stop after N iterations that finish nothing (default: 2)
+  JUDGE_DIFF_CAP   characters of the issue's diff shown to the criteria review
+                   (default: 60000); raise it for efforts with large UI slices
   ISSUE_ATTEMPT_LIMIT
                    stop once one issue has failed this many times (default: 3)
   JUDGE_MODEL      model used for the clean-context criteria review after
@@ -309,6 +311,7 @@ RETRY_DELAY="${RETRY_DELAY:-20}"
 STALL_LIMIT="${STALL_LIMIT:-2}"
 ISSUE_ATTEMPT_LIMIT="${ISSUE_ATTEMPT_LIMIT:-3}"
 JUDGE_MODEL="${JUDGE_MODEL-sonnet}"
+JUDGE_DIFF_CAP="${JUDGE_DIFF_CAP:-60000}"
 ESCALATE="${ESCALATE:-0}"
 PERMISSION_MODE="${PERMISSION_MODE:-auto}"
 
@@ -722,7 +725,7 @@ End with exactly one line: VERDICT: PASS  or  VERDICT: FAIL — <which criterion
 EOF
 }
 
-judge_criteria() { # $1 issue id, $2 sha before this iteration
+judge_criteria() { # $1 issue id, $2 sha to diff from (the claim; see JUDGE_BASE)
   local id=$1 before=$2 diff stat criteria invariants prompt out verdict trunc_note=
   JUDGE_REASON=
 
@@ -732,14 +735,14 @@ judge_criteria() { # $1 issue id, $2 sha before this iteration
 
   # Read one byte past the cap: its presence proves truncation without ever
   # holding the full diff in memory.
-  diff=$(git diff "$before"..HEAD 2>/dev/null | head -c 60001)
+  diff=$(git diff "$before"..HEAD 2>/dev/null | head -c $((JUDGE_DIFF_CAP + 1)))
   [ -n "$diff" ] || return 0
-  if [ "$(printf '%s' "$diff" | wc -c)" -gt 60000 ]; then
-    diff="${diff:0:60000}"
+  if [ "$(printf '%s' "$diff" | wc -c)" -gt "$JUDGE_DIFF_CAP" ]; then
+    diff="${diff:0:$JUDGE_DIFF_CAP}"
     # The file list restores what truncation hides: a touched test or config
     # file whose hunks fell past the cutoff should draw suspicion, not a pass.
     stat=$(git diff --stat "$before"..HEAD 2>/dev/null | head -c 4000)
-    trunc_note="NOTE: the diff below is TRUNCATED at 60,000 characters — it is not the whole
+    trunc_note="NOTE: the diff below is TRUNCATED at $JUDGE_DIFF_CAP characters — it is not the whole
 change. Every file it touches:
 
 $stat
@@ -1243,11 +1246,16 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     OUTCOME=$(printf '%s' "${BASH_REMATCH[2]}" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
     [ -n "$OUTCOME" ] || OUTCOME="completed"
 
-    # Baseline for "did this ticket produce a commit" and for the judge's diff.
-    # This iteration's HEAD when it committed something; otherwise the claim,
-    # so an earlier attempt's commit is judged rather than treated as absent.
+    # Baseline for "did this ticket produce a commit" and for the judge's diff:
+    # the claim, whenever it is known — not this iteration's HEAD. A retry that
+    # only repairs the previous attempt (the code landed, the review failed on
+    # a missing note) commits a fix-up that evidences none of the criteria by
+    # itself; judged from HEAD_BEFORE it can never pass, however right the
+    # issue's work is. Judged from the claim, the whole of it stays in view.
+    # HEAD_BEFORE is only the fallback for a claim_sha that is missing or no
+    # longer a commit here (rebased away, or a spec from before the field).
     JUDGE_BASE="$HEAD_BEFORE"
-    if [ "$IS_GIT" -eq 1 ] && [ "$(head_sha)" = "$HEAD_BEFORE" ]; then
+    if [ "$IS_GIT" -eq 1 ]; then
       CLAIM_SHA=$(claim_sha "$ISSUE_ID")
       if [ -n "$CLAIM_SHA" ] && git cat-file -e "$CLAIM_SHA^{commit}" 2>/dev/null; then
         JUDGE_BASE="$CLAIM_SHA"

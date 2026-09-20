@@ -117,6 +117,10 @@
           "items": { "type": "string", "minLength": 1 },
           "description": "Observable conditions that define done. The single source of truth — never duplicated into the body file. Injected verbatim as the ticket's definition of done, and judged against the iteration's git diff by loop.sh's clean-context criteria review — so each one must be evidenced by the diff, not by stated intent."
         },
+        "claim_sha": {
+          "type": "string",
+          "description": "HEAD sha the first time loop.sh claimed this issue; loop.sh deletes it when the issue is recorded done. Written by loop.sh, never by hand. It is the baseline for the no-commit gate and for the criteria review's diff, so a retry is judged on the issue's whole work rather than on its own fix-up commit, and work committed by a run that died before the ledger was written is still found. /to-issues --replan removes it together with `attempts` when it rewrites an issue."
+        },
         "attempts": {
           "type": "array",
           "description": "Append-only record of iterations that started this issue and did not complete it, written by loop.sh. Never authored by hand — /to-issues must not emit this field. The most recent entries are INJECTED INTO THE PROMPT on the next attempt so a fresh context window does not repeat a known-failing approach. Length is also the circuit breaker: at ISSUE_ATTEMPT_LIMIT the loop stops rather than burning more iterations.",

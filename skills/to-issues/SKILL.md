@@ -142,7 +142,7 @@ Invoked as `/to-issues <spec-dir> --replan <issue-id>` when `loop.sh` has circui
    - Rewrite the `criteria` and/or `body` in place.
    - Split it into smaller issues, inserted at its position in the array.
    - Add a `blocked_by` edge for a blocker that was genuinely missing.
-4. On any issue you rewrite or replace: reset its `status` to `"ready"` and clear its `attempts` array. This is the **one** sanctioned exception to "never write `attempts`" and "never touch status on issues that are done or claimed" — it applies only to the issue(s) being replanned, never to `done` issues or to `ledger`.
+4. On any issue you rewrite or replace: reset its `status` to `"ready"`, clear its `attempts` array, and delete its `claim_sha` field (the sha `loop.sh` recorded at first claim; leaving it would make the criteria review diff from before the abandoned attempts). This is the **one** sanctioned exception to "never write `attempts`" and "never touch status on issues that are done or claimed" — it applies only to the issue(s) being replanned, never to `done` issues or to `ledger`.
 5. Re-run `loop.sh <spec-dir> --check` to confirm the graph is still valid before handing it back.
 
 ## Anti-patterns
