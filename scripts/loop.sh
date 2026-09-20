@@ -1220,6 +1220,16 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     ATTEMPT=$((ATTEMPT + 1))
   done
 
+  # The promise is whatever sits between the LAST <promise> and the </promise>
+  # after it. Isolate it before matching: the outcome is free prose and can
+  # itself contain "<" (a type like Parsed<T>), which a [^<]* match stops at —
+  # turning a real DONE into "no completion promise", twice, and a stall.
+  PROMISE=
+  PROMISE_TAIL=${RESULT##*"<promise>"}
+  if [[ "$RESULT" == *"<promise>"* ]] && [[ "$PROMISE_TAIL" == *"</promise>"* ]]; then
+    PROMISE=${PROMISE_TAIL%%"</promise>"*}
+  fi
+
   # A rewritten spec.json invalidates every gate below it — the criteria the
   # judge reads and the commands run_verification runs both live there.
   # Revert it and fail the attempt; the promise is not worth parsing.
@@ -1232,7 +1242,7 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     FEEDBACK=1
   # An explicit BLOCKED is the agent telling us the graph is wrong or the
   # ticket is unbuildable. Retrying that burns the cap for nothing.
-  elif [[ "$RESULT" =~ \<promise\>BLOCKED:[[:space:]]*([A-Za-z0-9_-]+)[^\<]*\</promise\> ]]; then
+  elif [[ "$PROMISE" =~ ^BLOCKED:[[:space:]]*([A-Za-z0-9_-]+) ]]; then
     printf '\n%s✖%s  %s reported blocked on %s%s%s:\n\n' \
       "$RED" "$RESET" "claude" "$BOLD" "$ISSUE_ID" "$RESET" >&2
     print_message "$RESULT" >&2
@@ -1241,7 +1251,7 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     report_commits "$HEAD_BEFORE" >&2
     printf '   %s%s stays claimed; nothing was added to the ledger.%s\n\n' "$DIM" "$ISSUE_ID" "$RESET" >&2
     exit 1
-  elif [[ "$RESULT" =~ \<promise\>DONE:[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[^A-Za-z0-9\<]*([^\<]*)\</promise\> ]]; then
+  elif [[ "$PROMISE" =~ ^DONE:[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[^A-Za-z0-9]*(.*)$ ]]; then
     DONE_ID="${BASH_REMATCH[1]}"
     OUTCOME=$(printf '%s' "${BASH_REMATCH[2]}" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
     [ -n "$OUTCOME" ] || OUTCOME="completed"
