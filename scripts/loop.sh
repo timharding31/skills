@@ -10,38 +10,41 @@ esac
 
 usage() {
   cat <<EOF
-Usage: $0 <spec-dir|spec.json|gh-issue-url> [max-iterations] [--model <model>] [--check]
+Usage: $0 <spec-dir|spec.json> [max-iterations] [--model <model>] [--check]
 
 Works through a spec one issue per iteration until every issue is done.
 
   $0 specs/lab-modeling-v2
   $0 specs/lab-modeling-v2/spec.json 10
   $0 specs/lab-modeling-v2 --check     # validate + show the board, run nothing
-  $0 https://github.com/timharding31/ff-sim/issues/5 --model opus
+  $0 specs/lab-modeling-v2 --model opus
 
-Spec mode reads a spec.json written by /to-spec and /to-issues. The script — not
-the model — picks the next issue (first in array order whose blockers are all
+Reads a spec.json written by /to-spec and /to-issues. The script — not the
+model — picks the next issue (first in array order whose blockers are all
 done), injects only that issue plus the spec's summary/invariants/ledger, and
 records the result. The agent never edits spec.json — the loop snapshots the
 file before each iteration and reverts (and fails) any iteration that does.
 
-An issue is recorded done only when the agent promises DONE, the iteration's
-work is fully committed (new uncommitted changes fail the attempt — the checks
-test the working tree, but the ledger records the commit), every command in
+An issue is recorded done only when the agent promises DONE, every command in
 the spec's "verification" array (plus the issue's own "verification" commands,
 when present) exits 0, AND a clean-context review (a second,
 independent claude call that never saw the implementation) confirms the diff
 meets the ticket's criteria. A promise alone is not enough: the loop runs the
-checks itself, retrying a failing command once so a flaky test doesn't count. A failed iteration is recorded on the issue and replayed into
+checks itself. A failed iteration is recorded on the issue and replayed into
 the next attempt's prompt, so a fresh context window does not repeat an
 approach that already failed.
 
 An issue may carry a "model" field ("haiku" | "sonnet" | "opus" | "fable", or
 empty for the default) to override --model/CLAUDE_MODEL for that iteration only.
 
-GitHub mode works through the sub-issues of a parent issue, letting the model
-pick. It requires the gh CLI. The verification gate and attempt tracking are
-spec-mode only — GitHub mode has no spec to read them from.
+--model also accepts a model id served by Aperture, the internal AI gateway
+(e.g. "claude-opus-4-8", "claude-fable-5"). Anything that is not one of the
+four aliases is validated against the gateway's live provider list, and the
+whole run — including the judge — is routed through the gateway by exporting
+ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN. Only models the gateway serves on the
+Anthropic Messages API qualify (claude speaks nothing else); its GPT, Gemini,
+and open-weights models live on other wire protocols and are rejected with a
+pointer. Per-issue "model" fields stay alias-only.
 
 Env:
   MAX_ITERATIONS   default iteration cap (default: 50)
@@ -60,7 +63,9 @@ Env:
   ESCALATE         set to 1 to bump the model a tier (haiku→sonnet→opus) when
                    retrying an issue that already failed (default: off)
   PERMISSION_MODE  claude --permission-mode (default: auto; the loop needs
-                   gh/git/test commands, which acceptEdits does not cover)
+                   git/test commands, which acceptEdits does not cover)
+  APERTURE_URL     the Aperture gateway used for non-alias models
+                   (default: http://ai.civet-hops.ts.net)
   STREAM_WINDOW    live events kept on screen, older ones collapse to "..."
                    (default: 10; only applies on a terminal)
   NO_COLOR         set to disable colors
@@ -110,8 +115,11 @@ vlen() {
 }
 
 trunc() { # $1 text, $2 max
-  local t=$1
-  if [ "${#t}" -gt "$2" ]; then printf '%s…' "${t:0:$(($2 - 1))}"; else printf '%s' "$t"; fi
+  local t=$1 m=$2
+  # a caller's budget can go negative when other columns overrun the line;
+  # a negative substring length is a bash error, not a short string
+  [ "$m" -lt 1 ] && m=1
+  if [ "${#t}" -gt "$m" ]; then printf '%s…' "${t:0:$((m - 1))}"; else printf '%s' "$t"; fi
 }
 
 box_top()    { printf '%s╭%s╮%s\n' "$MAGENTA" "$(repeat '─' $((WIDTH - 2)))" "$RESET"; }
@@ -231,7 +239,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --model)
-      [ -z "$2" ] && die "--model requires a value (haiku|sonnet|opus|fable)."
+      [ -z "$2" ] && die "--model requires a value (haiku|sonnet|opus|fable, or an Aperture model id)."
       MODEL="$2"; shift 2 ;;
     --model=*) MODEL="${1#--model=}"; shift ;;
     --check) CHECK_ONLY=1; shift ;;
@@ -245,9 +253,53 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Which agent CLI runs the iterations. Aliases run claude as configured.
+# Anything else is resolved in order:
+#   1. an opencode provider/model ref (e.g. crusoe/zai/GLM-5.2) — this is how
+#      non-Claude models are reached, since claude speaks only the Anthropic
+#      Messages API and the gateways do not translate wire protocols;
+#   2. a Claude model id served on the Messages API by Aperture, the internal
+#      AI gateway — routed there by env for the whole run, judge included.
+# The judge stays on claude in opencode mode (no env is exported), so criteria
+# review keeps running on the subscription regardless of who implements.
+APERTURE_URL="${APERTURE_URL:-http://ai.civet-hops.ts.net}"
+OPENCODE_CMD="${OPENCODE_CMD:-opencode}"
+HARNESS=claude
+
 case "$MODEL" in
   haiku|sonnet|opus|fable|"") ;;
-  *) die "unknown model $MODEL (expected haiku, sonnet, opus, or fable)." ;;
+  *)
+    OPENCODE_MODELS=$(command -v "$OPENCODE_CMD" >/dev/null 2>&1 \
+      && "$OPENCODE_CMD" models 2>/dev/null || true)
+    if grep -qxF "$MODEL" <<<"$OPENCODE_MODELS"; then
+      HARNESS=opencode
+    else
+      # the first hit on the tailnet host can time out cold, hence the retries
+      APERTURE_PROVIDERS=$(curl -fsS --retry 2 --retry-connrefused --retry-all-errors \
+          --connect-timeout 5 --max-time 15 "$APERTURE_URL/api/providers" 2>/dev/null || true)
+      jq -e . >/dev/null 2>&1 <<<"$APERTURE_PROVIDERS" || \
+        die "unknown model $MODEL — not an alias, not an opencode ref (see: opencode models), and $APERTURE_URL is unreachable to check the gateway's model list."
+
+      APERTURE_OK=$(jq -r '.[] | select(.compatibility.anthropic_messages) | .models[]' <<<"$APERTURE_PROVIDERS")
+      if grep -qxF "$MODEL" <<<"$APERTURE_OK"; then
+        export ANTHROPIC_BASE_URL="$APERTURE_URL"
+        export ANTHROPIC_AUTH_TOKEN="-"
+      else
+        printf '\n%s✖%s  %s is not an alias, an opencode ref, or a Claude model on Aperture.\n' \
+          "$RED" "$RESET" "$MODEL" >&2
+        # a bare gateway id like zai/GLM-5.2 usually means the opencode ref
+        # (crusoe/zai/GLM-5.2) was intended — suggest the matches
+        HINTS=$(grep -F "/$MODEL" <<<"$OPENCODE_MODELS" || true)
+        if [ -n "$HINTS" ]; then
+          printf '\n   Did you mean one of these opencode refs?\n' >&2
+          printf '%s\n' "$HINTS" | sed 's/^/   · /' >&2
+        fi
+        printf '\n   %sRun `opencode models` for non-Claude models; Claude models on\n' "$DIM" >&2
+        printf '   Aperture: %s%s\n\n' "$(paste -sd' ' - <<<"$APERTURE_OK")" "$RESET" >&2
+        exit 1
+      fi
+    fi
+    ;;
 esac
 
 MAX_ITERATIONS="${ITERATIONS:-${MAX_ITERATIONS:-50}}"
@@ -259,6 +311,16 @@ ISSUE_ATTEMPT_LIMIT="${ISSUE_ATTEMPT_LIMIT:-3}"
 JUDGE_MODEL="${JUDGE_MODEL-sonnet}"
 ESCALATE="${ESCALATE:-0}"
 PERMISSION_MODE="${PERMISSION_MODE:-auto}"
+
+# The derived tool allowlist (regenerated by hooks/refresh-tools.sh) scopes
+# what an unattended iteration can do without a permission prompt — auto mode
+# alone would otherwise be the only guard on the whole run. Missing file just
+# means no allowlist, matching loop-once.sh and the cc alias.
+ALLOWED_TOOLS_ARGS=()
+if [ -f ~/.claude-allowed-tools.txt ]; then
+  ALLOWED_TOOLS=$(grep -v '^#' ~/.claude-allowed-tools.txt | grep -v '^$' | paste -s -d ',' -)
+  [ -n "$ALLOWED_TOOLS" ] && ALLOWED_TOOLS_ARGS=(--allowedTools "$ALLOWED_TOOLS")
+fi
 NO_PROGRESS=0
 SPENT=0
 
@@ -338,67 +400,45 @@ if ! [[ "$ISSUE_ATTEMPT_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
   die "ISSUE_ATTEMPT_LIMIT must be a positive integer, got $ISSUE_ATTEMPT_LIMIT."
 fi
 
-# The model in force for the next claude invocation. An issue's "model" field
-# beats this default for its iteration only, so one run can put cheap tickets on
-# haiku without splitting into several runs.
+# The model in force for the next iteration. An issue's "model" field beats
+# this default for its iteration only, so one run can put cheap tickets on
+# haiku without splitting into several runs. Per-issue values are alias-only,
+# so they always run claude — only the run default can be the opencode harness.
 use_model() { # $1 model name, "" = whatever claude is configured with
   MODEL_ARGS=()
+  ITER_HARNESS=claude
   [ -n "$1" ] && MODEL_ARGS=(--model "$1")
+  [ -n "$1" ] && [ "$1" = "$MODEL" ] && ITER_HARNESS="$HARNESS"
   MODEL_LABEL="${1:-default}"
   case "$1" in
     opus)   MODEL_COLOR="$MAGENTA" ;;
     sonnet) MODEL_COLOR="$BLUE" ;;
     haiku)  MODEL_COLOR="$TEAL" ;;
     fable)  MODEL_COLOR="$ORANGE" ;;
-    *)      MODEL_COLOR="$DIM" ;;
+    "")     MODEL_COLOR="$DIM" ;;
+    *)      MODEL_COLOR="$GREEN" ;;  # Aperture gateway model
   esac
 }
 
 use_model "$MODEL"
 
-[ -n "$TARGET" ] || { usage >&2; die "no spec path or GitHub issue URL given."; }
-
-# A github.com URL is the issue tracker; anything else is a spec on disk.
-if [[ "$TARGET" =~ ^(https?://|git@) ]] || [[ "$TARGET" == github.com/* ]]; then
-  MODE=gh
-else
-  MODE=spec
-fi
-
-# ── Parent: GitHub issue ──────────────────────────────────────────────────────
-if [ "$MODE" = gh ]; then
-  command -v gh >/dev/null 2>&1 || die "gh is required for GitHub issues but is not installed."
-
-  if [[ ! "$TARGET" =~ ^https?://github\.com/([^/]+)/([^/]+)/issues/([0-9]+)$ ]]; then
-    die "$TARGET is not a GitHub issue URL (expected https://github.com/<owner>/<repo>/issues/<n>)."
-  fi
-
-  OWNER="${BASH_REMATCH[1]}"; REPO="${BASH_REMATCH[2]}"; PARENT="${BASH_REMATCH[3]}"
-  SLUG="$OWNER/$REPO"
-
-  PARENT_TITLE=$(gh issue view "$PARENT" --repo "$SLUG" --json title --jq '.title')
-  SOURCE_LABEL="$SLUG"
-  BOARD_LABEL="${SLUG}#${PARENT}"
-  SOURCE_DETAIL="$TARGET"
-fi
+[ -n "$TARGET" ] || { usage >&2; die "no spec path given."; }
 
 # ── Parent: spec.json ─────────────────────────────────────────────────────────
 # Written by /to-spec (context only) and /to-issues (the issues array). See
 # ~/.claude/skills/to-spec/resources/spec.schema.json.
-if [ "$MODE" = spec ]; then
-  SPEC="$TARGET"
-  [ -d "$SPEC" ] && SPEC="$SPEC/spec.json"
+SPEC="$TARGET"
+[ -d "$SPEC" ] && SPEC="$SPEC/spec.json"
 
-  [ -f "$SPEC" ] || die "no spec.json at $SPEC."
-  jq -e . "$SPEC" >/dev/null 2>&1 || die "$SPEC is not valid JSON."
+[ -f "$SPEC" ] || die "no spec.json at $SPEC."
+jq -e . "$SPEC" >/dev/null 2>&1 || die "$SPEC is not valid JSON."
 
-  SPEC_DIR=$(dirname "$SPEC")
-  PARENT_TITLE=$(jq -r '.title // .slug // "untitled"' "$SPEC")
-  SOURCE_LABEL=$(jq -r '.slug // empty' "$SPEC")
-  [ -n "$SOURCE_LABEL" ] || SOURCE_LABEL=$(basename "$SPEC_DIR")
-  BOARD_LABEL="$SOURCE_LABEL"
-  SOURCE_DETAIL="$SPEC"
-fi
+SPEC_DIR=$(dirname "$SPEC")
+PARENT_TITLE=$(jq -r '.title // .slug // "untitled"' "$SPEC")
+SOURCE_LABEL=$(jq -r '.slug // empty' "$SPEC")
+[ -n "$SOURCE_LABEL" ] || SOURCE_LABEL=$(basename "$SPEC_DIR")
+BOARD_LABEL="$SOURCE_LABEL"
+SOURCE_DETAIL="$SPEC"
 
 # ── Spec validation ───────────────────────────────────────────────────────────
 # A malformed graph is worth failing on before burning an iteration, not
@@ -482,21 +522,15 @@ validate_spec() {
   fi
 }
 
-[ "$MODE" = spec ] && validate_spec
+validate_spec
 
 # ── Issues ────────────────────────────────────────────────────────────────────
-# Both modes emit the same board shape: [{number, id, title, state, wait}],
-# where state is one of done | claimed | blocked | ready.
-gh_issues() {
-  gh api --paginate "repos/$SLUG/issues/$PARENT/sub_issues" \
-    --jq '.[] | {number: (.number|tostring), id: (.number|tostring), title,
-                 state: (if .state == "open" then "ready" else "done" end), wait: ""}' \
-    2>/dev/null | jq -s '.'
-}
-
+# The board shape is [{number, id, title, state, wait}], where state is one of
+# done | claimed | blocked | ready.
+#
 # Blocked is derived, never stored: an issue is blocked while any id in its
 # blocked_by is not yet done.
-spec_issues() {
+issues() {
   jq '
     ((.issues // []) | map(select(.status == "done") | .id)) as $done
     | [ (.issues // []) | to_entries[]
@@ -511,10 +545,6 @@ spec_issues() {
                     else "ready" end),
             wait: ($wait | join(", ")) } ]
   ' "$SPEC"
-}
-
-issues() {
-  if [ "$MODE" = gh ]; then gh_issues; else spec_issues; fi
 }
 
 # The frontier: first issue in array order that is not done and whose blockers
@@ -543,13 +573,27 @@ write_spec() { # $1 jq filter, then jq args
   fi
 }
 
+# claim_sha is the HEAD the issue's work started from, and it survives a
+# restart. Without it, a run killed between commit and ledger update loses the
+# only record that the work landed: the next pass finds the ticket already
+# implemented, correctly commits nothing, and the no-commit gate rejects it
+# forever. Set once per claim — a re-attempt on a still-claimed issue keeps the
+# original baseline so the whole of its work stays in view.
 claim_issue() { # $1 id
-  write_spec '(.issues[] | select(.id == $id) | .status) = "claimed"' --arg id "$1"
+  write_spec '
+    (.issues[] | select(.id == $id)) |= (
+      .status = "claimed"
+      | (if (.claim_sha // "") == "" then .claim_sha = $sha else . end))
+  ' --arg id "$1" --arg sha "$(head_sha)"
+}
+
+claim_sha() { # $1 id
+  jq -r --arg id "$1" '(.issues // [])[] | select(.id == $id) | .claim_sha // ""' "$SPEC"
 }
 
 finish_issue() { # $1 id, $2 outcome, $3 commit sha (may be empty)
   write_spec '
-    (.issues[] | select(.id == $id) | .status) = "done"
+    (.issues[] | select(.id == $id)) |= (.status = "done" | del(.claim_sha))
     | .ledger = ((.ledger // []) + [
         {id: $id, outcome: $outcome, at: $at}
         + (if $commit == "" then {} else {commit: $commit} end)])
@@ -620,7 +664,7 @@ run_verification() { # $1 issue id (may be empty)
 
       # The prompt only ever sees a 3-line tail; the full output is what a
       # retry actually needs to diagnose a failure it didn't cause.
-      if [ "$MODE" = spec ] && [ -n "$ISSUE_ID" ]; then
+      if [ -n "$ISSUE_ID" ]; then
         local log_name
         log_name="$ISSUE_ID-$(($(attempt_count "$ISSUE_ID") + 1)).log"
         mkdir -p "$SPEC_DIR/attempts"
@@ -753,17 +797,27 @@ render_board() { # $1 issues json, $2 iteration, $3 status line
   box_line "$(progress_bar "$done_count" "$total" $((INNER - 14)))  ${BOLD}${GREEN}${pct}%${RESET} ${DIM}${done_count}/${total}${RESET}"
   box_line ""
 
-  local n t s w icon color note
+  local n t s w icon color note wt tmax nmax
   while IFS=$'\037' read -r n t s w; do
     [ -z "$n" ] && continue
-    note=
+    note= wt=
     case "$s" in
       done)    icon="${GREEN}✔${RESET}"; color="$DIM" ;;
       claimed) icon="${YELLOW}◐${RESET}"; color="$FG" ;;
-      blocked) icon="${DIM}○${RESET}"; color="$DIM"; note=" ${DIM}⇠ ${w}${RESET}" ;;
+      blocked)
+        icon="${DIM}○${RESET}"; color="$DIM"
+        # a fan-in issue can wait on every slug before it; cap the dep list at
+        # half the line so the title always keeps a readable share
+        nmax=$((INNER - 13 - ${#n} - 8))
+        [ "$nmax" -gt $((INNER / 2)) ] && nmax=$((INNER / 2))
+        wt=$(trunc "$w" "$nmax")
+        note=" ${DIM}⇠ ${wt}${RESET}"
+        ;;
       *)       icon="${DIM}○${RESET}"; color="$FG" ;;
     esac
-    box_line "  ${icon} ${DIM}${n}${RESET} ${color}$(trunc "$t" $((INNER - 10 - ${#n} - ${#w})))${RESET}${note}"
+    tmax=$((INNER - 10 - ${#n} - ${#wt}))
+    [ -n "$wt" ] && tmax=$((tmax - 3))
+    box_line "  ${icon} ${DIM}${n}${RESET} ${color}$(trunc "$t" "$tmax")${RESET}${note}"
     # unit separator, not tab: tab is IFS whitespace, so bash would collapse
     # consecutive empty fields and shift every column left
   done < <(jq -r '.[] | [.number, .title, .state, .wait] | join("")' <<<"$board")
@@ -1022,45 +1076,43 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
 
   # Picked before the board is drawn so the board's model chip names the model
   # this iteration will actually run on.
+  # The script picks, so the model spends no context deciding and the choice
+  # is reproducible from the graph.
+  # `|| true`: an empty frontier makes read fail, and set -e would kill the
+  # run before the diagnostic below explains why
   ISSUE_ID=
-  if [ "$MODE" = spec ]; then
-    # The script picks, so the model spends no context deciding and the choice
-    # is reproducible from the graph.
-    # `|| true`: an empty frontier makes read fail, and set -e would kill the
-    # run before the diagnostic below explains why
-    IFS=$'\037' read -r ISSUE_ID ISSUE_BODY ISSUE_MODEL ISSUE_TITLE < <(next_issue) || true
+  IFS=$'\037' read -r ISSUE_ID ISSUE_BODY ISSUE_MODEL ISSUE_TITLE < <(next_issue) || true
 
-    # Per-issue circuit breaker. The global stall guard can't tell "two issues
-    # each stumbled once" from "one issue has failed three times"; this can, and
-    # the second case is never fixed by trying again.
-    TRIES=0
-    if [ -n "$ISSUE_ID" ]; then
-      TRIES=$(attempt_count "$ISSUE_ID")
-      if [ "$TRIES" -ge "$ISSUE_ATTEMPT_LIMIT" ]; then
-        printf '\n%s✖%s  %s%s%s has failed %s time(s) — at the limit of %s.\n\n' \
-          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$TRIES" "$ISSUE_ATTEMPT_LIMIT" >&2
-        jq -r --arg id "$ISSUE_ID" '
-          (.issues // [])[] | select(.id == $id) | (.attempts // [])[]
-          | "   · \(.reason)\(if (.detail // "") == "" then "" else ": " + .detail end)"
-        ' "$SPEC" >&2
-        printf '\n   %sThe ticket is probably wrong, not the attempts. In Claude Code, run\n' "$DIM" >&2
-        printf '   /to-issues %s --replan %s to rewrite or split it from the attempt\n' "$SPEC_DIR" "$ISSUE_ID" >&2
-        printf '   record (it clears attempts on what it rewrites), then rerun the loop.\n' >&2
-        printf '   Hand-editing criteria and clearing "attempts" yourself also works.%s\n\n' "$RESET" >&2
-        exit 1
-      fi
+  # Per-issue circuit breaker. The global stall guard can't tell "two issues
+  # each stumbled once" from "one issue has failed three times"; this can, and
+  # the second case is never fixed by trying again.
+  TRIES=0
+  if [ -n "$ISSUE_ID" ]; then
+    TRIES=$(attempt_count "$ISSUE_ID")
+    if [ "$TRIES" -ge "$ISSUE_ATTEMPT_LIMIT" ]; then
+      printf '\n%s✖%s  %s%s%s has failed %s time(s) — at the limit of %s.\n\n' \
+        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$TRIES" "$ISSUE_ATTEMPT_LIMIT" >&2
+      jq -r --arg id "$ISSUE_ID" '
+        (.issues // [])[] | select(.id == $id) | (.attempts // [])[]
+        | "   · \(.reason)\(if (.detail // "") == "" then "" else ": " + .detail end)"
+      ' "$SPEC" >&2
+      printf '\n   %sThe ticket is probably wrong, not the attempts. In Claude Code, run\n' "$DIM" >&2
+      printf '   /to-issues %s --replan %s to rewrite or split it from the attempt\n' "$SPEC_DIR" "$ISSUE_ID" >&2
+      printf '   record (it clears attempts on what it rewrites), then rerun the loop.\n' >&2
+      printf '   Hand-editing criteria and clearing "attempts" yourself also works.%s\n\n' "$RESET" >&2
+      exit 1
     fi
+  fi
 
-    use_model "${ISSUE_MODEL:-$MODEL}"
+  use_model "${ISSUE_MODEL:-$MODEL}"
 
-    # Opt-in: a ticket that already failed gets a stronger model next time round.
-    # Only from a named tier — there is nothing to escalate an unnamed default from.
-    if [ "$ESCALATE" = 1 ] && [ "${TRIES:-0}" -gt 0 ]; then
-      case "$MODEL_LABEL" in
-        haiku)  use_model sonnet ;;
-        sonnet) use_model opus ;;
-      esac
-    fi
+  # Opt-in: a ticket that already failed gets a stronger model next time round.
+  # Only from a named tier — there is nothing to escalate an unnamed default from.
+  if [ "$ESCALATE" = 1 ] && [ "${TRIES:-0}" -gt 0 ]; then
+    case "$MODEL_LABEL" in
+      haiku)  use_model sonnet ;;
+      sonnet) use_model opus ;;
+    esac
   fi
 
   # Not on the first iteration — the banner is the only thing above it.
@@ -1068,31 +1120,17 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
 
   render_board "$BOARD" "$i" "${DIM}${OPEN} open${RESET}"
 
-  if [ "$MODE" = gh ]; then
-    SUB_LIST=$(jq -r '.[] | select(.state != "done") | "  - #\(.number): \(.title)"' <<<"$BOARD")
-    PROMPT="Parent issue: $SOURCE_DETAIL ($SLUG#$PARENT — $PARENT_TITLE)
-Open sub-issues:
-$SUB_LIST
-1. Run \`gh issue view <n> --repo $SLUG\` on the open sub-issues and pick the highest-priority one that is unblocked.
-2. Implement it.
-3. Run your tests and type checks.
-4. Comment on that sub-issue with what was done, then close it with \`gh issue close <n> --repo $SLUG\`.
-5. Commit your changes, referencing the sub-issue number in the commit message.
-ONLY WORK ON A SINGLE SUB-ISSUE.
-If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMPLETE</promise>."
-  else
-    if [ -z "$ISSUE_ID" ]; then
-      printf '\n%s✖%s  %s issue(s) remain but none are workable — every one is blocked.\n\n' \
-        "$RED" "$RESET" "$OPEN" >&2
-      jq -r '.[] | select(.state == "blocked") | "   · \(.id) waits on \(.wait)"' <<<"$BOARD" >&2
-      printf '\n   %sThat is a dependency cycle or a blocker id that never completes.%s\n\n' "$DIM" "$RESET" >&2
-      exit 1
-    fi
-
-    printf '%s ◆%s %s%s%s  %s%s%s\n' "$CYAN" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$ISSUE_TITLE" "$RESET"
-    claim_issue "$ISSUE_ID"
-    PROMPT=$(build_prompt "$ISSUE_ID" "$ISSUE_BODY")
+  if [ -z "$ISSUE_ID" ]; then
+    printf '\n%s✖%s  %s issue(s) remain but none are workable — every one is blocked.\n\n' \
+      "$RED" "$RESET" "$OPEN" >&2
+    jq -r '.[] | select(.state == "blocked") | "   · \(.id) waits on \(.wait)"' <<<"$BOARD" >&2
+    printf '\n   %sThat is a dependency cycle or a blocker id that never completes.%s\n\n' "$DIM" "$RESET" >&2
+    exit 1
   fi
+
+  printf '%s ◆%s %s%s%s  %s%s%s\n' "$CYAN" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$ISSUE_TITLE" "$RESET"
+  claim_issue "$ISSUE_ID"
+  PROMPT=$(build_prompt "$ISSUE_ID" "$ISSUE_BODY")
 
   # Transient API failures shouldn't kill an unattended run — retry the same
   # iteration with backoff. The spec holds the state, so a retry is safe.
@@ -1103,40 +1141,56 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
   # "Do NOT edit $SPEC" is enforced, not trusted: criteria, verification, and
   # status all live in spec.json, and /specs/* is usually gitignored, so an
   # agent edit (weakened criteria, dropped checks) would otherwise be invisible.
-  SPEC_SNAPSHOT=
-  if [ "$MODE" = spec ]; then
-    SPEC_SNAPSHOT=$(mktemp)
-    cp "$SPEC" "$SPEC_SNAPSHOT"
-  fi
+  SPEC_SNAPSHOT=$(mktemp)
+  cp "$SPEC" "$SPEC_SNAPSHOT"
   while :; do
     ITER_START=$(date +%s)
     OUT=$(mktemp)
 
     if [ "$ATTEMPT" -eq 1 ]; then
-      printf '%s ╭─ %sclaude%s %s(%s)%s%s working…%s\n' "$DIM" "$BLUE" "$RESET" "$MODEL_COLOR" "$MODEL_LABEL" "$RESET" "$DIM" "$RESET"
+      printf '%s ╭─ %s%s%s %s(%s)%s%s working…%s\n' "$DIM" "$BLUE" "$ITER_HARNESS" "$RESET" "$MODEL_COLOR" "$MODEL_LABEL" "$RESET" "$DIM" "$RESET"
     else
-      printf '%s ╭─ %sclaude%s %s(%s)%s%s retry %s/%s…%s\n' "$DIM" "$BLUE" "$RESET" "$MODEL_COLOR" "$MODEL_LABEL" "$RESET" "$YELLOW" "$((ATTEMPT - 1))" "$RETRIES" "$RESET"
+      printf '%s ╭─ %s%s%s %s(%s)%s%s retry %s/%s…%s\n' "$DIM" "$BLUE" "$ITER_HARNESS" "$RESET" "$MODEL_COLOR" "$MODEL_LABEL" "$RESET" "$YELLOW" "$((ATTEMPT - 1))" "$RETRIES" "$RESET"
     fi
 
     set +e
-    # `auto`, not `acceptEdits`: the loop needs gh/git/test commands, and in
-    # non-interactive -p mode an unapprovable prompt is an automatic denial.
-    $CLAUDE_CMD "${MODEL_ARGS[@]}" --permission-mode "$PERMISSION_MODE" \
-      --output-format stream-json --verbose -p "$PROMPT" 2>&1 | tee "$OUT" | stream_render
+    if [ "$ITER_HARNESS" = opencode ]; then
+      # --auto is opencode's non-interactive permission approval, the moral
+      # equivalent of claude's --permission-mode auto below.
+      $OPENCODE_CMD run --format json --auto -m "$MODEL_LABEL" "$PROMPT" 2>&1 | tee "$OUT" | stream_render
+    else
+      # `auto`, not `acceptEdits`: the loop needs git/test commands, and in
+      # non-interactive -p mode an unapprovable prompt is an automatic denial.
+      $CLAUDE_CMD "${MODEL_ARGS[@]}" --permission-mode "$PERMISSION_MODE" \
+        "${ALLOWED_TOOLS_ARGS[@]}" \
+        --output-format stream-json --verbose -p "$PROMPT" 2>&1 | tee "$OUT" | stream_render
+    fi
     STATUS=${PIPESTATUS[0]}
     set -e
 
     RAW=$(cat "$OUT"); rm -f "$OUT"
-    # the final assistant text lives in the terminating result event
-    RESULT=$(jq -Rr 'fromjson? | select(.type == "result") | (.result // "")' <<<"$RAW" 2>/dev/null || true)
-    [ -z "$RESULT" ] && RESULT="$RAW"
-    IS_ERROR=$(jq -Rr 'fromjson? | select(.type == "result") | (.is_error // false)' <<<"$RAW" 2>/dev/null | tail -1)
+    if [ "$ITER_HARNESS" = opencode ]; then
+      # opencode emits one event per completed part; the promise lives in the
+      # text parts. It exits 0 even when the provider errored, so error
+      # detection is the presence of an error event, not the exit status.
+      RESULT=$(jq -Rrn '[inputs | fromjson? | select(.type == "text") | (.part.text // "")] | join("\n")' \
+        <<<"$RAW" 2>/dev/null || true)
+      IS_ERROR=$(jq -Rrn '[inputs | fromjson? | select(.type == "error")] | length > 0' \
+        <<<"$RAW" 2>/dev/null || echo true)
+      add_cost "$(jq -Rrn '[inputs | fromjson? | select(.type == "step_finish") | (.part.cost // 0)] | add // 0' \
+                   <<<"$RAW" 2>/dev/null || true)"
+    else
+      # the final assistant text lives in the terminating result event
+      RESULT=$(jq -Rr 'fromjson? | select(.type == "result") | (.result // "")' <<<"$RAW" 2>/dev/null || true)
+      IS_ERROR=$(jq -Rr 'fromjson? | select(.type == "result") | (.is_error // false)' <<<"$RAW" 2>/dev/null | tail -1)
 
-    # Retries cost money too, so this accumulates per attempt, not per iteration.
-    # `// empty` so a transcript without the field degrades to zero rather than
-    # taking the loop down.
-    add_cost "$(jq -Rr 'fromjson? | select(.type == "result") | (.total_cost_usd // empty)' \
-                 <<<"$RAW" 2>/dev/null | tail -1)"
+      # Retries cost money too, so this accumulates per attempt, not per iteration.
+      # `// empty` so a transcript without the field degrades to zero rather than
+      # taking the loop down.
+      add_cost "$(jq -Rr 'fromjson? | select(.type == "result") | (.total_cost_usd // empty)' \
+                   <<<"$RAW" 2>/dev/null | tail -1)"
+    fi
+    [ -z "$RESULT" ] && RESULT="$RAW"
 
     printf '%s ╰─ %s%s%s%s\n' "$DIM" "$ORANGE" "$(hms $(($(date +%s) - ITER_START)))" "$RESET" "$(cost_chip)"
 
@@ -1150,7 +1204,7 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
 
     if [ "$ATTEMPT" -gt "$RETRIES" ]; then
       printf '\n%s✖%s  claude failed (%s) on iteration %s after %s retries.\n' "$RED" "$RESET" "$REASON" "$i" "$RETRIES" >&2
-      [ "$MODE" = spec ] && [ -n "$ISSUE_ID" ] && record_attempt "$ISSUE_ID" "run failed" "$REASON"
+      [ -n "$ISSUE_ID" ] && record_attempt "$ISSUE_ID" "run failed" "$REASON"
       report_commits "$HEAD_BEFORE" >&2
       printf '   %sRerun to resume; %s is still claimed and will be re-picked.%s\n\n' \
         "$DIM" "${ISSUE_ID:-the open issue}" "$RESET" >&2
@@ -1163,91 +1217,96 @@ If every sub-issue of $SLUG#$PARENT is complete and closed, output <promise>COMP
     ATTEMPT=$((ATTEMPT + 1))
   done
 
-  if [ "$MODE" = gh ]; then
-    if [[ "$RESULT" == *"<promise>COMPLETE</promise>"* ]]; then
-      render_board "$(issues)" "$i" "${GREEN}${BOLD}COMPLETE${RESET}"
-      printf '%s✔%s  %s %scomplete%s in %s%s%s after %s iteration(s).%s\n\n' \
-        "$GREEN" "$RESET" "$BOARD_LABEL" "$BOLD" "$RESET" "$TEAL" "$(hms $(($(date +%s) - START)))" "$RESET" "$i" "$(spend_note)"
-      exit 0
+  # A rewritten spec.json invalidates every gate below it — the criteria the
+  # judge reads and the commands run_verification runs both live there.
+  # Revert it and fail the attempt; the promise is not worth parsing.
+  if ! cmp -s "$SPEC_SNAPSHOT" "$SPEC"; then
+    cp "$SPEC_SNAPSHOT" "$SPEC"
+    printf '%s ✖%s %s%s%s  %sedited spec.json — reverted, promise discarded%s\n' \
+      "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+    record_attempt "$ISSUE_ID" "edited the spec" \
+      "the iteration modified spec.json, which the loop owns; it was reverted and the promise discarded"
+    FEEDBACK=1
+  # An explicit BLOCKED is the agent telling us the graph is wrong or the
+  # ticket is unbuildable. Retrying that burns the cap for nothing.
+  elif [[ "$RESULT" =~ \<promise\>BLOCKED:[[:space:]]*([A-Za-z0-9_-]+)[^\<]*\</promise\> ]]; then
+    printf '\n%s✖%s  %s reported blocked on %s%s%s:\n\n' \
+      "$RED" "$RESET" "claude" "$BOLD" "$ISSUE_ID" "$RESET" >&2
+    print_message "$RESULT" >&2
+    printf '\n' >&2
+    record_attempt "$ISSUE_ID" "reported blocked" "$RESULT"
+    report_commits "$HEAD_BEFORE" >&2
+    printf '   %s%s stays claimed; nothing was added to the ledger.%s\n\n' "$DIM" "$ISSUE_ID" "$RESET" >&2
+    exit 1
+  elif [[ "$RESULT" =~ \<promise\>DONE:[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[^A-Za-z0-9\<]*([^\<]*)\</promise\> ]]; then
+    DONE_ID="${BASH_REMATCH[1]}"
+    OUTCOME=$(printf '%s' "${BASH_REMATCH[2]}" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    [ -n "$OUTCOME" ] || OUTCOME="completed"
+
+    # Baseline for "did this ticket produce a commit" and for the judge's diff.
+    # This iteration's HEAD when it committed something; otherwise the claim,
+    # so an earlier attempt's commit is judged rather than treated as absent.
+    JUDGE_BASE="$HEAD_BEFORE"
+    if [ "$IS_GIT" -eq 1 ] && [ "$(head_sha)" = "$HEAD_BEFORE" ]; then
+      CLAIM_SHA=$(claim_sha "$ISSUE_ID")
+      if [ -n "$CLAIM_SHA" ] && git cat-file -e "$CLAIM_SHA^{commit}" 2>/dev/null; then
+        JUDGE_BASE="$CLAIM_SHA"
+      fi
+    fi
+
+    if [ "$DONE_ID" != "$ISSUE_ID" ]; then
+      printf '%s ⚠%s  promise names %q but the assigned ticket was %q — not recording it.\n' \
+        "$YELLOW" "$RESET" "$DONE_ID" "$ISSUE_ID"
+    # Fresh uncommitted changes mean the tree the checks would test is not
+    # the commit the ledger would record — fail before spending time on
+    # verification that could only certify the wrong state.
+    elif NEW_DIRT=$(new_dirt) && [ -n "$NEW_DIRT" ]; then
+      printf '%s ✖%s %s%s%s  %spromised done, but left new uncommitted changes — not recording it%s\n' \
+        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+      printf '%s\n' "$NEW_DIRT" | head -10 | while IFS= read -r l; do
+        printf '   %s%s%s\n' "$DIM" "$l" "$RESET"
+      done
+      record_attempt "$ISSUE_ID" "left uncommitted changes" \
+        "the working tree gained uncommitted changes the commit lacks ($(printf '%s' "$NEW_DIRT" | tr '\n' ' ')); commit everything the ticket produced"
+      FEEDBACK=1
+    # The promise is a claim; the spec's verification commands are the check.
+    # Failing here leaves the issue claimed, so the next pass re-picks it with
+    # the failure replayed into its prompt.
+    elif ! run_verification "$ISSUE_ID"; then
+      printf '%s ✖%s %s%s%s  %spromised done, but verification failed — not recording it%s\n' \
+        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+      record_attempt "$ISSUE_ID" "verification failed" "$VERIFY_FAILURE"
+      FEEDBACK=1
+    # No commit means no diff for the judge and nothing traceable in the
+    # ledger — and verification may only be passing off uncommitted work.
+    # That's a failed attempt, not a warning. Measured from the claim, not from
+    # this iteration: work committed by an earlier attempt that died before the
+    # ledger was written is still this issue's commit, and the agent is right
+    # to add nothing on top of it.
+    elif [ "$IS_GIT" -eq 1 ] && [ -n "$JUDGE_BASE" ] && [ "$(head_sha)" = "$JUDGE_BASE" ]; then
+      printf '%s ✖%s %s%s%s  %spromised done, but committed nothing — not recording it%s\n' \
+        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+      record_attempt "$ISSUE_ID" "committed nothing" \
+        "the DONE promise requires a commit; any work is only in the working tree"
+      FEEDBACK=1
+    # Verification proves the checks pass; it says nothing about whether the
+    # diff did what the ticket asked. A fresh context with no stake in its own
+    # work is the closest a single model gets to reviewing that honestly.
+    elif ! judge_criteria "$ISSUE_ID" "$JUDGE_BASE"; then
+      printf '%s ✖%s %s%s%s  %sdiff failed criteria review — not recording it%s\n' \
+        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
+      record_attempt "$ISSUE_ID" "criteria review failed" "$JUDGE_REASON"
+      FEEDBACK=1
+    else
+      HEAD_AFTER=$(head_sha)
+      finish_issue "$ISSUE_ID" "$OUTCOME" "$HEAD_AFTER"
+      printf '%s ✔%s %s%s%s  %s%s%s\n' "$GREEN" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$OUTCOME" "$RESET"
     fi
   else
-    # A rewritten spec.json invalidates every gate below it — the criteria the
-    # judge reads and the commands run_verification runs both live there.
-    # Revert it and fail the attempt; the promise is not worth parsing.
-    if [ -n "$SPEC_SNAPSHOT" ] && ! cmp -s "$SPEC_SNAPSHOT" "$SPEC"; then
-      cp "$SPEC_SNAPSHOT" "$SPEC"
-      printf '%s ✖%s %s%s%s  %sedited spec.json — reverted, promise discarded%s\n' \
-        "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
-      record_attempt "$ISSUE_ID" "edited the spec" \
-        "the iteration modified spec.json, which the loop owns; it was reverted and the promise discarded"
-      FEEDBACK=1
-    # An explicit BLOCKED is the agent telling us the graph is wrong or the
-    # ticket is unbuildable. Retrying that burns the cap for nothing.
-    elif [[ "$RESULT" =~ \<promise\>BLOCKED:[[:space:]]*([A-Za-z0-9_-]+)[^\<]*\</promise\> ]]; then
-      printf '\n%s✖%s  %s reported blocked on %s%s%s:\n\n' \
-        "$RED" "$RESET" "claude" "$BOLD" "$ISSUE_ID" "$RESET" >&2
-      print_message "$RESULT" >&2
-      printf '\n' >&2
-      record_attempt "$ISSUE_ID" "reported blocked" "$RESULT"
-      report_commits "$HEAD_BEFORE" >&2
-      printf '   %s%s stays claimed; nothing was added to the ledger.%s\n\n' "$DIM" "$ISSUE_ID" "$RESET" >&2
-      exit 1
-    elif [[ "$RESULT" =~ \<promise\>DONE:[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[^A-Za-z0-9\<]*([^\<]*)\</promise\> ]]; then
-      DONE_ID="${BASH_REMATCH[1]}"
-      OUTCOME=$(printf '%s' "${BASH_REMATCH[2]}" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
-      [ -n "$OUTCOME" ] || OUTCOME="completed"
-
-      if [ "$DONE_ID" != "$ISSUE_ID" ]; then
-        printf '%s ⚠%s  promise names %q but the assigned ticket was %q — not recording it.\n' \
-          "$YELLOW" "$RESET" "$DONE_ID" "$ISSUE_ID"
-      # Fresh uncommitted changes mean the tree the checks would test is not
-      # the commit the ledger would record — fail before spending time on
-      # verification that could only certify the wrong state.
-      elif NEW_DIRT=$(new_dirt) && [ -n "$NEW_DIRT" ]; then
-        printf '%s ✖%s %s%s%s  %spromised done, but left new uncommitted changes — not recording it%s\n' \
-          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
-        printf '%s\n' "$NEW_DIRT" | head -10 | while IFS= read -r l; do
-          printf '   %s%s%s\n' "$DIM" "$l" "$RESET"
-        done
-        record_attempt "$ISSUE_ID" "left uncommitted changes" \
-          "the working tree gained uncommitted changes the commit lacks ($(printf '%s' "$NEW_DIRT" | tr '\n' ' ')); commit everything the ticket produced"
-        FEEDBACK=1
-      # The promise is a claim; the spec's verification commands are the check.
-      # Failing here leaves the issue claimed, so the next pass re-picks it with
-      # the failure replayed into its prompt.
-      elif ! run_verification "$ISSUE_ID"; then
-        printf '%s ✖%s %s%s%s  %spromised done, but verification failed — not recording it%s\n' \
-          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
-        record_attempt "$ISSUE_ID" "verification failed" "$VERIFY_FAILURE"
-        FEEDBACK=1
-      # No commit means no diff for the judge and nothing traceable in the
-      # ledger — and verification may only be passing off uncommitted work.
-      # That's a failed attempt, not a warning.
-      elif [ "$IS_GIT" -eq 1 ] && [ -n "$HEAD_BEFORE" ] && [ "$(head_sha)" = "$HEAD_BEFORE" ]; then
-        printf '%s ✖%s %s%s%s  %spromised done, but committed nothing — not recording it%s\n' \
-          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
-        record_attempt "$ISSUE_ID" "committed nothing" \
-          "the DONE promise requires a commit; any work is only in the working tree"
-        FEEDBACK=1
-      # Verification proves the checks pass; it says nothing about whether the
-      # diff did what the ticket asked. A fresh context with no stake in its own
-      # work is the closest a single model gets to reviewing that honestly.
-      elif ! judge_criteria "$ISSUE_ID" "$HEAD_BEFORE"; then
-        printf '%s ✖%s %s%s%s  %sdiff failed criteria review — not recording it%s\n' \
-          "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
-        record_attempt "$ISSUE_ID" "criteria review failed" "$JUDGE_REASON"
-        FEEDBACK=1
-      else
-        HEAD_AFTER=$(head_sha)
-        finish_issue "$ISSUE_ID" "$OUTCOME" "$HEAD_AFTER"
-        printf '%s ✔%s %s%s%s  %s%s%s\n' "$GREEN" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$OUTCOME" "$RESET"
-      fi
-    else
-      record_attempt "$ISSUE_ID" "no completion promise" "$(printf '%s' "$RESULT" | tail -c 300)"
-    fi
+    record_attempt "$ISSUE_ID" "no completion promise" "$(printf '%s' "$RESULT" | tail -c 300)"
   fi
 
-  if [ -n "$SPEC_SNAPSHOT" ]; then rm -f "$SPEC_SNAPSHOT"; SPEC_SNAPSHOT=; fi
+  rm -f "$SPEC_SNAPSHOT"
 
   # An iteration that finishes nothing usually means claude is stuck (blocked
   # on permissions, missing context, …), and repeating it just burns the cap.
