@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en" data-theme="tokyonight">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpectroVision</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>%E2%97%86</text></svg>">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header id="top">
+    <div class="top-main">
+      <div class="ident">
+        <span class="diamond">◆</span>
+        <span class="slug" id="slug">…</span>
+        <span class="title" id="title"></span>
+      </div>
+      <div class="pathline" id="specpath"></div>
+    </div>
+    <div class="top-side">
+      <div class="runrow">
+        <div class="runpill" id="runpill"><span class="dot"></span><span id="runtext">connecting</span></div>
+        <button id="killrun" style="display:none" title="SIGINT the loop's process group — exactly Ctrl-C">✕ kill</button>
+      </div>
+      <div class="stamp" id="stamp"></div>
+    </div>
+    <div class="progress">
+      <div class="bar"><div class="fill" id="fill"></div></div>
+      <div class="pct"><span id="pct">0%</span> <span class="dim" id="count">0/0</span></div>
+    </div>
+  </header>
+
+  <div id="shell">
+    <nav id="rail">
+      <div class="rail-group">
+        <div class="rail-head">views</div>
+        <a class="rail-item" data-view="overview" href="#overview"><span class="g">▤</span>Overview</a>
+        <a class="rail-item" data-view="graph" href="#graph"><span class="g">⛓</span>Dependency graph</a>
+        <a class="rail-item" data-view="context" href="#context"><span class="g">▨</span>context.md</a>
+        <a class="rail-item" data-view="notes" href="#notes"><span class="g">✎</span>NOTES.md</a>
+        <a class="rail-item" data-view="ledger" href="#ledger"><span class="g">✦</span>Ledger</a>
+        <a class="rail-item" data-view="attempts" href="#attempts"><span class="g">⚑</span>Attempt logs <span class="badge" id="attempt-badge"></span></a>
+      </div>
+      <div class="rail-group">
+        <div class="rail-head">issues</div>
+        <div id="issue-list"></div>
+      </div>
+    </nav>
+    <main id="main"></main>
+    <aside id="dock"></aside>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -6,6 +6,7 @@ My personal [Claude Code](https://claude.com/claude-code) setup: custom skills a
 
 - `skills/` — custom Claude Code skills
 - `scripts/` — supporting scripts used by skills or hooks
+- `tools/` — standalone tools that aren't skills (e.g. SpectroVision)
 - `CLAUDE.md` — global instructions loaded into every session
 
 Only these paths are tracked; everything else in `~/.claude` (sessions, caches, local settings, credentials, etc.) is intentionally excluded.
@@ -49,3 +50,9 @@ The agent implements. Everything else is the script's job, so a confused or cras
 Agents working in parallel each make implicit decisions the others can't see: what to name things, where to put the seam, how errors surface, which of two plausible shapes an interface takes. Those choices never appear in any ticket, so nothing catches them until the branches meet. The cheap version of that failure is a merge conflict. The expensive version is two halves that both work alone and disagree about the thing they share.
 
 Serial execution plus the ledger means every issue is built against what actually exists rather than against a sibling's guess about it. Wall-clock time is the thing being traded away, and it's the cheapest thing in the pipeline.
+
+## Tools
+
+`tools/` holds standalone programs that aren't skills — nothing here is invoked as a `/slash-command`; each is run directly.
+
+- **[`spectrovision`](tools/spectrovision)** — A hot-reloading web view of the `specs/<slug>/` directories `scripts/loop.sh` drives: the issue board, ledger, per-issue criteria and attempts, and a live indicator for whether a loop is currently running. Put `tools/spectrovision/bin/sv` on `PATH` (it follows symlinks) and run `sv` from any repo with a `./specs/<slug>/spec.json`.

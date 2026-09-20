@@ -1,0 +1,12 @@
+#!/bin/sh
+# Launcher for PATH. Follows symlinks so ~/.local/bin/sv works.
+target=$0
+while [ -L "$target" ]; do
+  link=$(readlink "$target")
+  case $link in
+    /*) target=$link ;;
+    *) target=$(dirname "$target")/$link ;;
+  esac
+done
+here=$(cd "$(dirname "$target")/.." && pwd)
+exec node "$here/server.mjs" "$@"
