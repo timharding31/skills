@@ -1,6 +1,8 @@
 ---
 name: to-spec
 description: Turn a rough request, a design conversation, or a pile of research into a structured spec.json — the durable context for one effort. Use when the user wants to spec out a feature, write a PRD, capture a plan before building, or says "to-spec". Writes context only; /to-issues decomposes it into work.
+user_invocable: true
+allowed-tools: Read,Write,Edit,Bash,Glob,Grep,AskUserQuestion,Agent
 ---
 
 # To Spec

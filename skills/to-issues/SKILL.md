@@ -1,6 +1,8 @@
 ---
 name: to-issues
 description: Decompose a spec.json into an ordered, dependency-aware list of issues plus one prose body file each. Use when the user wants to break a spec into tickets, plan implementation slices, or says "to-issues". Run after /to-spec.
+user_invocable: true
+allowed-tools: Read,Write,Edit,Bash,Glob,Grep,AskUserQuestion,Agent
 ---
 
 # To Issues

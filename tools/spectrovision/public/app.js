@@ -809,6 +809,7 @@ document.addEventListener('keydown', async (e) => {
     return
   }
   if (typing) return
+  if (e.metaKey || e.ctrlKey) return
 
   const list = issues()
   const at = list.findIndex((i) => i.id === state.issueId)
