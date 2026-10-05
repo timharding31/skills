@@ -8,6 +8,18 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *) export LC_ALL=en_US.UTF-8 ;;
 esac
 
+# An unattended run must not idle-sleep the Mac mid-verification: a sleeping
+# laptop stalls Testcontainers and fails whole suites. --check needs no guard.
+case " $* " in
+  *" --check "*) ;;
+  *)
+    if [ -z "${LOOP_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+      export LOOP_CAFFEINATED=1
+      exec caffeinate -i "$0" "$@"
+    fi
+    ;;
+esac
+
 usage() {
   cat <<EOF
 Usage: $0 <spec-dir|spec.json> [max-iterations] [--model <model>] [--check]
@@ -351,6 +363,29 @@ new_dirt() {
   comm -13 <(printf '%s\n' "$DIRTY_BEFORE") <(dirty_paths)
 }
 
+# The part of new_dirt the agent can have made: paths its transcript ($RAW: every
+# tool call, command and output) names, by path or by file name. The rest is
+# someone else editing the same checkout mid-iteration (writing the next spec,
+# an ADR), which used to fail a correct ticket. A miss in either direction only
+# falls back to failing as before: a stray mention counts the path as the
+# agent's. Sets OWN_DIRT and FOREIGN_DIRT, newline-separated.
+OWN_DIRT=
+FOREIGN_DIRT=
+split_new_dirt() {
+  local path name
+  OWN_DIRT=
+  FOREIGN_DIRT=
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    name=$(basename "$path")
+    if [[ "$RAW" == *"$path"* || "$RAW" == *"$name"* ]]; then
+      OWN_DIRT+="$path"$'\n'
+    else
+      FOREIGN_DIRT+="$path"$'\n'
+    fi
+  done < <(new_dirt)
+}
+
 # What an iteration actually left behind. The old message asserted "nothing was
 # committed" without checking, which is false whenever an agent commits and then
 # dies on the next tool call.
@@ -527,6 +562,55 @@ validate_spec() {
 
 validate_spec
 
+# ── Spec lint ─────────────────────────────────────────────────────────────────
+# Warnings, not errors: each names a ticket shape that has stalled an unattended
+# run before. Only ready issues are linted; done and claimed work is history.
+lint_spec() {
+  local warnings body id
+
+  warnings=$(jq -r '
+    (.issues // []) as $is
+    | [
+        # A criterion that needs a live third-party run to succeed stalls the
+        # loop when that service is down; the judge reads only diff vs criteria.
+        ($is[] | select(.status == "ready") | . as $i | (.criteria // [])[]
+          | select(test("\\blive\\b|third[- ]party|external (service|api)|gateway"; "i"))
+          | select(test("record"; "i") | not)
+          | "\($i.id): criterion depends on a live service but accepts no recorded failure: \"\(.[0:90])\""),
+        # The review must run after every other issue, including ones added
+        # later by a replan. Issues downstream of it (ship-pr) are exempt.
+        ($is | map(select(.id == "quality-review"))[0] // empty | . as $q
+          | ["quality-review"]
+          | until(. as $after
+                  | ($is | map(select(any((.blocked_by // [])[]; . as $b | $after | index($b))) | .id)
+                     - $after) == [];
+                  . as $after
+                  | . + ($is | map(select(any((.blocked_by // [])[]; . as $b | $after | index($b))) | .id)
+                     - $after)) as $after
+          | ($is | map(.id) - $after - ($q.blocked_by // [])) as $missing
+          | select($missing | length > 0)
+          | "quality-review: not blocked by \($missing | join(", "))")
+      ] | .[]
+  ' "$SPEC")
+
+  # The loop carries only the tail of NOTES.md and of blockers' Comments, so a
+  # body must say what to read in full before starting.
+  while IFS=$'\t' read -r id body; do
+    [ -f "$SPEC_DIR/$body" ] || continue
+    grep -qiE '^(## |\*\*)Before you start' "$SPEC_DIR/$body" \
+      || warnings+=$'\n'"$id: body has no \"## Before you start\" section naming what to read first"
+  done < <(jq -r '.issues[] | select(.status == "ready" and .body != null and .body != "" and .id != "quality-review") | [.id, .body] | @tsv' "$SPEC")
+
+  [ -n "${warnings//[[:space:]]/}" ] || return 0
+  printf '\n%s⚠%s  %s has tickets shaped like past stalls:\n\n' "$YELLOW" "$RESET" "$SPEC" >&2
+  while IFS= read -r warning; do
+    [ -n "$warning" ] && printf '   %s·%s %s\n' "$YELLOW" "$RESET" "$warning" >&2
+  done <<<"$warnings"
+  printf '\n' >&2
+}
+
+lint_spec
+
 # ── Issues ────────────────────────────────────────────────────────────────────
 # The board shape is [{number, id, title, state, wait}], where state is one of
 # done | claimed | blocked | ready.
@@ -694,7 +778,7 @@ JUDGE_REASON=
 # A heredoc apostrophe inside `x=$(cat <<EOF ...)` confuses bash's parser (it
 # tries to balance quotes across the substitution); a separate function whose
 # own stdout is captured sidesteps that.
-judge_prompt() { # $1 criteria bullets, $2 invariants bullets (may be empty), $3 diff, $4 truncation note (may be empty)
+judge_prompt() { # $1 criteria bullets, $2 invariants bullets (may be empty), $3 diff, $4 truncation note (may be empty), $5 passed-check bullets (may be empty)
   cat <<EOF
 You are reviewing a diff against a ticket's acceptance criteria. You did not
 write this code. Judge only what the diff shows — do not assume unstated work
@@ -709,6 +793,19 @@ EOF
 Effort-wide invariants — a diff that violates any of these FAILS even when
 every criterion is met:
 $2
+EOF
+
+  [ -n "$5" ] && cat <<EOF
+
+The loop ran these commands itself on this work, before you, and every one
+exited 0. Their results are facts, not claims made by the implementer:
+$5
+
+A criterion that one of these commands proves is MET, even when the diff
+cannot show it: remote or external state (a branch pushed at HEAD, an open
+pull request) never appears in a diff. Do not fail a criterion for lack of
+diff evidence when a passing command above checks it; judge the diff for the
+rest.
 EOF
 
   [ -n "$4" ] && printf '\n%s\n' "$4"
@@ -726,7 +823,7 @@ EOF
 }
 
 judge_criteria() { # $1 issue id, $2 sha to diff from (the claim; see JUDGE_BASE)
-  local id=$1 before=$2 diff stat criteria invariants prompt out verdict trunc_note=
+  local id=$1 before=$2 diff stat criteria invariants checks prompt out verdict trunc_note=
   JUDGE_REASON=
 
   [ -n "$JUDGE_MODEL" ] || return 0
@@ -757,10 +854,18 @@ grounds for suspicion, not a pass."
     (.issues // [])[] | select(.id == $id) | (.criteria // [])[] | "- " + .
   ' "$SPEC")
   invariants=$(jq -r '(.invariants // [])[] | "- " + .' "$SPEC")
+  # The judge runs only after run_verification passed, so every command it
+  # ran is a known pass. Without this list the judge fails criteria only a
+  # command can see (a pushed branch, an open PR), however true they are.
+  checks=$(jq -r --arg id "$id" '
+    (.verification // [])[],
+    ((.issues // [])[] | select(.id == $id) | (.verification // [])[])
+    | "- `" + . + "`"
+  ' "$SPEC")
 
   printf '%s ⋯%s %sreviewing diff against criteria (%s)%s\n' "$DIM" "$RESET" "$DIM" "$JUDGE_MODEL" "$RESET"
 
-  prompt=$(judge_prompt "$criteria" "$invariants" "$diff" "$trunc_note")
+  prompt=$(judge_prompt "$criteria" "$invariants" "$diff" "$trunc_note" "$checks")
 
   set +e
   out=$($CLAUDE_CMD --model "$JUDGE_MODEL" --output-format json -p "$prompt" 2>&1)
@@ -998,6 +1103,11 @@ conflict with the invariants or you need provenance."
    required env vars, patterns to follow) as one-line bullets to
    $SPEC_DIR/NOTES.md. Seam-level notes about this ticket go under its
    \"## Comments\" heading instead.")
+  rules+=("Run every command in the foreground (use a long timeout if needed), never
+   in the background. This session is headless: a background task's completion
+   notice never arrives, so a turn that ends waiting for one ends the iteration
+   with no promise. Run the checks this ticket needs; the loop runs the full
+   verification gate itself after your DONE.")
   rules+=("Commit your work, referencing the ticket id \"$id\" in the message.")
   rules+=("Do NOT edit $SPEC. The loop owns issue status and the ledger, snapshots
    the file before you start, and reverts any change you make to it — an edited
@@ -1272,20 +1382,26 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
       fi
     fi
 
+    split_new_dirt
+    if [ -n "$FOREIGN_DIRT" ]; then
+      printf '%s ⚠%s  %snew uncommitted changes the agent never named, left alone: %s%s\n' \
+        "$YELLOW" "$RESET" "$DIM" "$(printf '%s' "$FOREIGN_DIRT" | tr '\n' ' ')" "$RESET"
+    fi
+
     if [ "$DONE_ID" != "$ISSUE_ID" ]; then
       printf '%s ⚠%s  promise names %q but the assigned ticket was %q — not recording it.\n' \
         "$YELLOW" "$RESET" "$DONE_ID" "$ISSUE_ID"
     # Fresh uncommitted changes mean the tree the checks would test is not
     # the commit the ledger would record — fail before spending time on
     # verification that could only certify the wrong state.
-    elif NEW_DIRT=$(new_dirt) && [ -n "$NEW_DIRT" ]; then
+    elif [ -n "$OWN_DIRT" ]; then
       printf '%s ✖%s %s%s%s  %spromised done, but left new uncommitted changes — not recording it%s\n' \
         "$RED" "$RESET" "$BOLD" "$ISSUE_ID" "$RESET" "$DIM" "$RESET"
-      printf '%s\n' "$NEW_DIRT" | head -10 | while IFS= read -r l; do
+      printf '%s' "$OWN_DIRT" | head -10 | while IFS= read -r l; do
         printf '   %s%s%s\n' "$DIM" "$l" "$RESET"
       done
       record_attempt "$ISSUE_ID" "left uncommitted changes" \
-        "the working tree gained uncommitted changes the commit lacks ($(printf '%s' "$NEW_DIRT" | tr '\n' ' ')); commit everything the ticket produced"
+        "the working tree gained uncommitted changes the commit lacks ($(printf '%s' "$OWN_DIRT" | tr '\n' ' ')); commit everything the ticket produced"
       FEEDBACK=1
     # The promise is a claim; the spec's verification commands are the check.
     # Failing here leaves the issue claimed, so the next pass re-picks it with

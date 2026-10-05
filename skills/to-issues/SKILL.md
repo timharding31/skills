@@ -60,12 +60,21 @@ Ordering: dependency order first, then risk. Put the issue that proves the risky
 
 <Why this slice exists and what it unlocks — a short paragraph.>
 
+## Before you start
+
+<What to read in full before writing code: `<spec-dir>/NOTES.md` and
+`<spec-dir>/context.md` (the sections that matter), any blocker's
+`## Comments`, the decision records this slice must honour, and the source
+files it builds on, with the symbols to look at.>
+
 <The shape the solution should take: the seam it creates or consumes, the
 approach to prefer, the approach to avoid and why. Enough that an agent with
 no other context makes the same call you would.>
 
 ## Comments
 ```
+
+`## Before you start` is required. The loop injects only the last ~2,000 characters of NOTES.md and ~1,500 of each blocker's Comments, so anything a slice depends on beyond that tail has to be named here or the implementer works without it. `loop.sh --check` warns on a ready body without it.
 
 Keep it to what changes the implementation. Leave `## Comments` empty — the implementing agent writes its own notes there as work completes, and the loop feeds that section to whichever issues list this one in their `blocked_by`. That is the channel for seam-level detail the ledger's one-liner can't carry ("takes a `LeagueSettings`, not a `leagueId`"), so the heading must be present even when there's nothing under it yet.
 
@@ -78,9 +87,12 @@ Use `"body": null` when the criteria genuinely say everything and there's no rat
 - `attempts` — **never write this.** Like `status` and `ledger`, it belongs to `loop.sh`, which records each failed iteration there and replays the most recent ones into the next attempt's prompt. The one exception is replanning a stuck issue — see [Replanning a stuck issue](#replanning-a-stuck-issue---replan) below.
 - `blocked_by` — ids only, and only *hard* blockers: this issue cannot be correctly built until that one exists. Do not encode mere preference; a false blocker serialises work that could have been done in any order.
 - `criteria` — observable conditions, each checkable by running something or reading the resulting code. "Replacement level shifts with superflex" is checkable. "Code is clean" is not. Criteria are also what the post-verification diff review judges against, so write each one to be checkable by reading the diff and running the verification commands — not by trusting the implementer's stated intent.
+  - A criterion that depends on a **live external service** (a model gateway, a third-party API, a live eval) must say that a recorded failure satisfies it (what was printed, the attempts, the wall clock), and where it is recorded. "Both X and Y succeed live" stalls the run the night that service is down, because the judge reads only the diff against the criteria and ignores anything said in Comments. `loop.sh --check` warns on a ready criterion that mentions a live service and no recorded failure.
+  - A criterion about **remote state** (a branch pushed at HEAD, an open PR, what its body says) never shows in a diff. Back every such fact with its own `verification` command; the judge is told those commands passed (`test "$(gh pr view <branch> --json state --jq .state)" = OPEN`, `gh pr view <branch> --json body --jq .body | grep -q 'React Doctor'`). Keep the criterion to exactly what the commands prove: anything a command doesn't check, the judge has to take on trust.
+  - An issue that changes what a user sees needs a **runtime gate** in its `verification` (the repo's smoke or end-to-end check), not only unit tests and a typecheck.
 - `verification` — shell commands specific to this issue, executed by the loop after the effort-level `verification` under the same gate. Whenever a criterion says tests exist or behavior holds, name the command that proves it (`npm test -- src/vorp.spec.ts`) — a deterministic check beats a model reading a diff. Commands must be real and runnable from the repo root; when the criteria name a test file the issue itself creates, the command must still exit non-zero before that file exists (most runners fail on a missing named file, which is what you want). Omit the field when the effort-level commands already cover the issue.
 - `files` — the paths to start from.
-- `model` — **omit unless the user asks for per-issue models.** `"haiku"`, `"sonnet"`, `"opus"`, or `"fable"`; it overrides the model `loop.sh` was launched with, for that iteration only. When they do ask, assign it from the work: mechanical, well-specified edits can take `haiku`; issues carrying the design risk you ordered early take `opus`. Leave it off everywhere you have no reason to differ from the run's default.
+- `model` — `"haiku"`, `"sonnet"`, `"opus"`, or `"fable"`; it overrides the model `loop.sh` was launched with, for that iteration only. **Decide it for every issue, unprompted** (the user had to ask "do any of these need opus?" on four efforts in a row): set `"opus"` on each issue that carries design risk — the ones you ordered early, and any touching locking or lock order, concurrency, a schema or data migration, security or an auth / share boundary, money, a cross-module refactor, or a quality-review / ship-pr gate. Mechanical, well-specified edits may take `haiku`. Leave it off where the run's default fits. In your reply, list the issues you pinned to `opus` with one reason each, so the user can veto rather than ask.
 
 ### 6. Append the final quality-review issue
 
@@ -102,13 +114,19 @@ Unless the user opts out, or the effort has only one issue, the **last** issue i
 ```
 
 - `blocked_by` lists **every other id** — this is the one issue where a total edge set is correct, so it runs exactly once, after everything.
-- `model: "opus"` is the default and the exception to "omit `model`": ambitious restructuring is the one ticket that earns a stronger model than the run's default. Honor a user's different choice.
+- `model: "opus"` is the default here: ambitious restructuring always earns a stronger model than the run's default. Honor a user's different choice.
 - Keep the criteria falsifiable, as above — "code quality improved" is exactly the unfalsifiable criterion this skill bans, and the loop's judge would have nothing to check.
 - Criteria must also be *visible to the judge*, which sees one flattened diff: commit boundaries, commit messages, and anything under gitignored `specs/` (including `## Comments`) never appear in it. Conventions like one-commit-per-restructuring or recording skipped findings belong in the body's instructions, not in `criteria`.
 
 Body (`issues/quality-review.md`): instruct the implementer to review the effort's *whole* diff — the ledger in its prompt lists each completed issue's short commit SHA; the range is from the parent of the first ledger commit to HEAD. If the `thermo-nuclear-code-quality-review` skill is available, invoke it and adapt it to that local diff (skip its GitLab MR-fetching steps; the review standards apply unchanged). Otherwise carry its core stance inline in the body: be ambitious about structural simplification, hunt for "code judo" moves that make whole branches or layers disappear, preserve behavior exactly, and treat any file crossing 1k lines as a smell.
 
-The body must also instruct three closing duties the criteria can't carry (see the judge-visibility bullet above): keep each restructuring in its own commit whose message references quality-review; record findings judged not worth a code change under this issue's `## Comments`; and read `<spec-dir>/NOTES.md`, promoting every bullet that is true of the repo beyond this effort (build quirks, required env vars, conventions to follow) into the repo's CLAUDE.md — or AGENTS.md, if that is the repo's convention. NOTES.md lives in a gitignored directory and dies with the spec; anything left unpromoted is relearned at full price by the next effort. End with the standard `## Comments` heading.
+The body must also instruct three closing duties the criteria can't carry (see the judge-visibility bullet above): keep each restructuring in its own commit whose message references quality-review; record findings judged not worth a code change under this issue's `## Comments`; and read `<spec-dir>/NOTES.md` plus every issue's `## Comments` and `attempts`, and promote each lesson that is true of the repo beyond this effort. NOTES.md lives in a gitignored directory and dies with the spec; anything left unpromoted is relearned at full price by the next effort. Promote each lesson at the highest level that works, the order the `correct` skill uses:
+   1. **Architecture**: make the mistake impossible (one owner, the wrong import fails, one source of truth).
+   2. **Types**: make the bad state unrepresentable.
+   3. **A lint or test whose failure names the fix** (for example a rule in the repo's existing guard test, if it has one). Prove it fails on the mistake this effort actually made.
+   4. **A line in the repo's CLAUDE.md, or AGENTS.md if that is the repo's convention**, only for judgment calls and facts nothing can check (build quirks, required env vars). Every line there is read by every future iteration, so keep it to one line, and when an existing line covers the lesson, edit that line rather than adding a second.
+
+   Record under `## Comments` which level each lesson went to, and why a higher one didn't work. End with the standard `## Comments` heading.
 
 ### 7. Validate
 
