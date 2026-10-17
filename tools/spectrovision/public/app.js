@@ -16,6 +16,7 @@ const state = {
   error: null,
   dirty: false,        // an open editor has unsaved keystrokes
   lastFlash: 0,
+  archiveOpen: false,  // the archived list in the specs dock
 }
 
 const $ = (sel) => document.querySelector(sel)
@@ -150,8 +151,8 @@ function connect () {
 // -------------------------------------------------------------- routing
 
 function readHash () {
-  const h = decodeURIComponent(location.hash.replace(/^#/, ''))
-  const parts = h.split('/').filter(Boolean)
+  // Split before decoding: an archived slug is `archive%2F<slug>`, one part.
+  const parts = location.hash.replace(/^#/, '').split('/').filter(Boolean).map(decodeURIComponent)
   if (!parts.length) return
   state.slug = parts[0]
   const rest = parts.slice(1)
@@ -321,23 +322,41 @@ function renderDock () {
   $('#dock').innerHTML = tabs + (state.dock === 'specs' ? specBrowser() : dockDetail())
 }
 
+function specCard (s) {
+  const pct = s.total ? Math.round((s.done / s.total) * 100) : 0
+  const live = s.run && s.run.running
+  return `<div class="spec-card ${s.slug === state.slug ? 'on' : ''}" data-spec="${esc(s.slug)}">
+    <div class="spec-top">
+      <span class="spec-name">${esc(s.slug)}</span>
+      ${live ? '<span class="live-dot" title="loop.sh running"></span>' : ''}
+    </div>
+    <div class="spec-title">${esc(s.broken ? 'spec.json will not parse' : s.title)}</div>
+    <div class="bar mini"><div class="fill" style="width:${pct}%"></div></div>
+    <div class="spec-meta">${s.done}/${s.total} done${s.claimed ? ` · ${s.claimed} claimed` : ''} · ${relTime(s.mtime)}</div>
+  </div>`
+}
+
+function archiveRow (s) {
+  const name = s.slug.replace(/^archive\//, '')
+  const when = s.finished || s.mtime
+  return `<div class="arch-row ${s.slug === state.slug ? 'on' : ''}" data-spec="${esc(s.slug)}" title="${esc(s.title)}">
+    <span class="arch-name">${esc(name)}</span>
+    <span class="arch-when">${when ? new Date(when).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : ''}</span>
+  </div>`
+}
+
 function specBrowser () {
-  const specs = (state.data.specs || [])
+  const all = state.data.specs || []
+  const live = all.filter((s) => !s.archived)
+  const archived = all.filter((s) => s.archived).sort((a, b) => (b.finished || b.mtime) - (a.finished || a.mtime))
+  const open = state.archiveOpen || archived.some((s) => s.slug === state.slug)
   return `<div class="dock-body">
     <div class="dock-head">${esc(state.data.specsDir)}</div>
-    ${specs.map((s) => {
-      const pct = s.total ? Math.round((s.done / s.total) * 100) : 0
-      const live = s.run && s.run.running
-      return `<div class="spec-card ${s.slug === state.slug ? 'on' : ''}" data-spec="${esc(s.slug)}">
-        <div class="spec-top">
-          <span class="spec-name">${esc(s.slug)}</span>
-          ${live ? '<span class="live-dot" title="loop.sh running"></span>' : ''}
-        </div>
-        <div class="spec-title">${esc(s.broken ? 'spec.json will not parse' : s.title)}</div>
-        <div class="bar mini"><div class="fill" style="width:${pct}%"></div></div>
-        <div class="spec-meta">${s.done}/${s.total} done${s.claimed ? ` · ${s.claimed} claimed` : ''} · ${relTime(s.mtime)}</div>
-      </div>`
-    }).join('')}
+    ${live.map(specCard).join('')}
+    ${archived.length ? `<button class="arch-head ${open ? 'open' : ''}" data-archive-toggle>
+      <span class="arch-caret">▸</span>archived<span class="arch-count">${archived.length}</span>
+    </button>
+    ${open ? `<div class="arch-list">${archived.map(archiveRow).join('')}</div>` : ''}` : ''}
   </div>`
 }
 
@@ -729,8 +748,9 @@ function newIssue () {
 }
 
 document.addEventListener('click', async (e) => {
-  const specCard = e.target.closest('[data-spec]')
-  if (specCard) { goSpec(specCard.dataset.spec); return }
+  const specEl = e.target.closest('[data-spec]')
+  if (specEl) { goSpec(specEl.dataset.spec); return }
+  if (e.target.closest('[data-archive-toggle]')) { state.archiveOpen = !state.archiveOpen; renderDock(); return }
   const dockTab = e.target.closest('[data-dock]')
   if (dockTab) { state.dock = dockTab.dataset.dock; renderDock(); return }
   const mv = e.target.closest('[data-move]')
@@ -838,7 +858,7 @@ function paletteItems () {
   }
   for (const s of state.data.specs || []) {
     if (s.slug === state.slug) continue
-    items.push({ label: `spec: ${s.slug}`, hint: `${s.done}/${s.total}`, hash: `#${encodeURIComponent(s.slug)}/overview` })
+    items.push({ label: `spec: ${s.slug}`, hint: s.archived ? 'archived' : `${s.done}/${s.total}`, hash: `#${encodeURIComponent(s.slug)}/overview` })
   }
   return items
 }

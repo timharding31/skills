@@ -61,30 +61,41 @@ let INITIAL = null
 
 const isSpecDir = (p) => fs.existsSync(path.join(p, 'spec.json'))
 
-if (stat.isFile()) {
-  const dir = path.dirname(resolved)
-  SPECS_DIR = path.dirname(dir)
-  INITIAL = path.basename(dir)
-} else if (isSpecDir(resolved)) {
-  SPECS_DIR = path.dirname(resolved)
-  INITIAL = path.basename(resolved)
+// A spec inside specs/archive/ opens with its archive siblings, so its slug
+// keeps the `archive/` prefix and SPECS_DIR stays the parent of archive/.
+const ARCHIVE = 'archive'
+function specLocation (dir) {
+  const parent = path.dirname(dir)
+  if (path.basename(parent) === ARCHIVE) return { specsDir: path.dirname(parent), slug: `${ARCHIVE}/${path.basename(dir)}` }
+  return { specsDir: parent, slug: path.basename(dir) }
+}
+
+if (stat.isFile() || isSpecDir(resolved)) {
+  const loc = specLocation(stat.isFile() ? path.dirname(resolved) : resolved)
+  SPECS_DIR = loc.specsDir
+  INITIAL = loc.slug
 } else if (fs.existsSync(path.join(resolved, 'specs'))) {
   SPECS_DIR = path.join(resolved, 'specs')
 } else {
   die(`no specs here — expected ${path.join(resolved, 'specs')}/<slug>/spec.json, or point me at a spec dir`)
 }
 
-function listSlugs () {
+function listSlugsIn (dir, prefix) {
   let names = []
-  try { names = fs.readdirSync(SPECS_DIR) } catch { return [] }
-  return names.filter((n) => !n.startsWith('.') && isSpecDir(path.join(SPECS_DIR, n))).sort()
+  try { names = fs.readdirSync(dir) } catch { return [] }
+  return names.filter((n) => !n.startsWith('.') && isSpecDir(path.join(dir, n))).sort().map((n) => prefix + n)
+}
+
+// Archived specs come after the live ones as `archive/<slug>`.
+function listSlugs () {
+  return [...listSlugsIn(SPECS_DIR, ''), ...listSlugsIn(path.join(SPECS_DIR, ARCHIVE), `${ARCHIVE}/`)]
 }
 
 if (!listSlugs().length) die(`no spec.json under ${SPECS_DIR}/*/ — nothing to view`)
 // With no argument, open whichever spec was touched last — during a run that
 // is the one loop.sh is working.
 if (!INITIAL) {
-  INITIAL = listSlugs()
+  INITIAL = (listSlugsIn(SPECS_DIR, '').length ? listSlugsIn(SPECS_DIR, '') : listSlugs())
     .map((slug) => {
       let m = 0
       try { m = fs.statSync(path.join(SPECS_DIR, slug, 'spec.json')).mtimeMs } catch { /* keep 0 */ }
@@ -237,12 +248,14 @@ async function specSummaries () {
     out.push({
       slug,
       dir,
+      archived: slug.startsWith(`${ARCHIVE}/`),
       title: (spec && spec.title) || slug,
       broken: !spec,
       total: list.length,
       done: list.filter((i) => i.status === 'done').length,
       claimed: list.filter((i) => i.status === 'claimed').length,
       mtime: await mtimeIf(path.join(dir, 'spec.json')),
+      finished: Math.max(0, ...((spec && spec.ledger) || []).map((l) => Date.parse(l.at) || 0)),
       run: await runningState(dir),
     })
   }

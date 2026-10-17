@@ -543,6 +543,28 @@ section.card.editing { border-color: var(--blue); }
 .spec-title { color: var(--fg-dim); font-size: 12px; margin: 2px 0 7px; line-height: 1.4; }
 .spec-meta { color: var(--comment); font-size: 11px; margin-top: 5px; }
 .bar.mini { height: 3px; }
+
+.arch-head {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  margin: 14px 0 6px; padding: 6px 2px 6px 0;
+  background: none; border: none; border-top: 1px solid var(--line);
+  color: var(--comment); font: inherit; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  cursor: pointer;
+}
+.arch-head:hover { color: var(--fg-dim); }
+.arch-caret { display: inline-block; transition: transform .12s; font-size: 10px; }
+.arch-head.open .arch-caret { transform: rotate(90deg); }
+.arch-count { margin-left: auto; background: var(--bg-hi); border-radius: 9px; padding: 0 7px; line-height: 17px; letter-spacing: 0; }
+.arch-list { display: flex; flex-direction: column; }
+.arch-row {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 5px 9px; border-left: 2px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+  color: var(--fg-dim); font-size: 12px; cursor: pointer;
+}
+.arch-row:hover { background: var(--bg-panel); }
+.arch-row.on { border-left-color: var(--blue); background: var(--bg-hi); color: var(--fg); }
+.arch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.arch-when { margin-left: auto; flex: none; color: var(--comment); font-size: 11px; }
 .live-dot {
   width: 7px; height: 7px; border-radius: 50%; background: var(--green);
   margin-left: auto; flex: none; animation: pulse 1.6s ease-in-out infinite;
