@@ -80,6 +80,20 @@ This applies to everything you produce: replies, commit messages, MR description
 33. **Duplicate tests.** Tests that assert the same behavior as an existing test under a new name or with trivially different inputs, and tests that only exercise a mock. Merge them into one table-driven test or delete the copy.
 34. **Style drift.** Naming, idioms, or patterns inconsistent with the file and surrounding codebase. Match what's there, not what's generically "best".
 
+## UI copy patterns
+
+35. **Sub-labels that restate state.** A secondary line under a tab, step, button or row
+    that repeats what its label, icon, color or position already says ("Scale set" under a
+    checked Scale step, "Main floor" under Floor). Delete it. Add one only when it carries a
+    fact the user can't see elsewhere and needs before clicking (a count, an error).
+36. **Instruction text beside a control.** "Click a room to check it", "Drag a corner to
+    resize". If the affordance needs a sentence, fix the affordance (cursor, hover state,
+    tooltip). Keyboard shortcuts go in tooltips, not inline.
+37. **Status chips on every row.** A badge that's the same for most rows is noise. Show the
+    exception, not the default.
+38. **Default to fewer words.** Before adding any string to a UI, ask what the user would
+    do differently without it. If nothing, cut it.
+
 ## Guardrails
 
 - Keep behavior unchanged unless you fix a clear bug, and say so if you do.
