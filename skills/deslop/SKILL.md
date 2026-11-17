@@ -15,7 +15,7 @@ This applies to everything you produce: replies, commit messages, MR description
 1. Pick the scope.
    - Prose: the text you are writing, or the text you were asked to edit.
    - Code: the branch diff (`git diff main...HEAD`, or the working tree if uncommitted). Touch only lines the branch introduced.
-2. Scan for the patterns below. The prose rules also apply to comments, docstrings, and commit messages.
+2. Scan for the patterns below. The prose rules also apply to comments, docstrings, and commit messages. For user-facing strings, run the interface copy rules (36 to 41) first, before any phrasing pass.
 3. Rewrite. Preserve meaning and behavior. Match the intended tone and the file's local style.
 4. After code edits, re-run the project's tests and lint if a verify command exists.
 5. When you ran this as an explicit pass, report what you removed and why in 1 to 3 sentences.
@@ -79,20 +79,27 @@ This applies to everything you produce: replies, commit messages, MR description
 32. **Over-nesting.** Deeply nested conditionals that early returns or guard clauses would flatten.
 33. **Duplicate tests.** Tests that assert the same behavior as an existing test under a new name or with trivially different inputs, and tests that only exercise a mock. Merge them into one table-driven test or delete the copy.
 34. **Style drift.** Naming, idioms, or patterns inconsistent with the file and surrounding codebase. Match what's there, not what's generically "best".
+35. **Tautological tests.** Tests that restate the implementation instead of checking behavior. Watch for three kinds. Boundary tests that hardcode a constant's value ("accepts 50, rejects 51" for `MAX = 50`). Exact-string assertions on user-facing copy. Tests that recompute the function's own logic to get the expected value. A test like this fails when someone makes an intentional change and passes when the behavior is wrong. Assert the behavior instead: input is accepted vs. rejected, or build the boundary input from the constant itself (`MAX + 1` items). Keep a hardcoded value only when it pins an external contract, such as a backend or schema limit, and say so in a comment.
 
-## UI copy patterns
+## Interface copy
 
-35. **Sub-labels that restate state.** A secondary line under a tab, step, button or row
-    that repeats what its label, icon, color or position already says ("Scale set" under a
-    checked Scale step, "Main floor" under Floor). Delete it. Add one only when it carries a
-    fact the user can't see elsewhere and needs before clicking (a count, an error).
-36. **Instruction text beside a control.** "Click a room to check it", "Drag a corner to
-    resize". If the affordance needs a sentence, fix the affordance (cursor, hover state,
-    tooltip). Keyboard shortcuts go in tooltips, not inline.
-37. **Status chips on every row.** A badge that's the same for most rows is noise. Show the
-    exception, not the default.
-38. **Default to fewer words.** Before adding any string to a UI, ask what the user would
-    do differently without it. If nothing, cut it.
+Applies to labels, hints, captions, empty states, toasts, confirmations, and button text. Most bad copy is well written but should not be on the screen, and editing it for tone only makes the wrong thing read better. Ask whether the string should exist before asking how to phrase it. Walk each string through rules 36 to 38 in order and delete at the first one that fires.
+
+36. **Copy nobody wondered about.** If the user would not have asked the question unprompted, the string plants a worry instead of answering one. "The preview is rendered at the exact size used on your profile" under an avatar cropper makes the user doubt the preview.
+37. **Caption that restates the label.** A caption or sub-label earns its place only when the value is meaningless without it. "How many times we retry" under a field labeled "Retry limit" is noise. So is a sub-label that repeats what the label, icon, color, or position already says, such as "Scale set" under a checked Scale step. "seconds" beside a bare "30" stays.
+38. **Scar-tissue warnings.** Copy that rules out a failure instead of describing behavior, such as "Always keeps transferred files. Never wipes the folder like the old cancel did." It exists because of a fixed bug the user never saw. The fix is the fix, not a caption about it. The same applies to copy defending a design decision or hedging about something that works ("this may look slow but it isn't", "don't worry if the count seems off").
+39. **Rewrite, then delete if empty.** Remove the offending clause and see what is left. If nothing, delete the element: drop an empty `hint` prop, delete the explanatory `<p>` instead of shortening it to a stub. Cut whole clauses before trimming words.
+40. **Instruction text beside a control.** "Click a room to check it", "Drag a corner to resize". If the affordance needs a sentence, fix the affordance with a cursor, hover state, or tooltip. Keyboard shortcuts go in tooltips, not inline.
+41. **Status chips on every row.** A badge that is the same for most rows is noise. Show the exception, not the default.
+
+Keep copy when the user cannot act without it:
+
+- A real consequence at the moment of choosing, such as "Anything not yet synced is lost." under a destructive button. Cut any follow-on that tells them when they may press it ("only use this when a sync is stuck").
+- A scope or compatibility fact they cannot see, such as "Works with keys issued after March; older keys need rotating first."
+- What a blank state means and the next step, such as "No projects yet. Create one and it will appear here."
+- Units, scale, or format on a bare value.
+
+When reviewing a batch, read each string next to the label, value, and button around it, since redundancy is invisible in isolation. Report as `file:line`, the current string, and either the rewrite or `cut`, with a few words on which rule it failed. Do not rewrite copy that passes. If a string matters only in a rare state, move it to that state instead of leaving it on the page permanently.
 
 ## Guardrails
 
